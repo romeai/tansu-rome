@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, RootMessageMeta};
+use crate::{DecodeLimit, DecodeLimits, Error, Result, RootMessageMeta};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{
     Deserializer,
@@ -28,9 +28,81 @@ use std::{
 use tansu_model::{FieldMeta, MessageMeta};
 use tracing::{debug, warn};
 
-const MESSAGE_MAX_SIZE: usize = 1024 * 1024 * 1024;
-
 const PARSE_DEPTH: usize = 6;
+
+#[derive(Clone, Debug)]
+struct DecodeContext {
+    limits: DecodeLimits,
+    allocation_bytes: usize,
+    work_units: usize,
+    nesting_depth: usize,
+}
+
+impl DecodeContext {
+    fn new(limits: DecodeLimits, initial_work_units: usize) -> Result<Self> {
+        limits.validate()?;
+        let mut context = Self {
+            limits,
+            allocation_bytes: 0,
+            work_units: 0,
+            nesting_depth: 0,
+        };
+        context.charge_work(initial_work_units)?;
+        Ok(context)
+    }
+
+    fn check(&self, kind: DecodeLimit, actual: usize, limit: usize) -> Result<()> {
+        if actual > limit {
+            Err(Error::DecodeLimitExceeded {
+                kind,
+                limit,
+                actual,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn charge_allocation(&mut self, amount: usize) -> Result<()> {
+        let actual = self
+            .allocation_bytes
+            .checked_add(amount)
+            .ok_or(Error::Overflow)?;
+        self.check(
+            DecodeLimit::TotalAllocationBytes,
+            actual,
+            self.limits.max_total_allocation_bytes,
+        )?;
+        self.allocation_bytes = actual;
+        Ok(())
+    }
+
+    fn charge_work(&mut self, amount: usize) -> Result<()> {
+        let actual = self.work_units.checked_add(amount).ok_or(Error::Overflow)?;
+        self.check(
+            DecodeLimit::TotalWorkUnits,
+            actual,
+            self.limits.max_total_work_units,
+        )?;
+        self.work_units = actual;
+        Ok(())
+    }
+
+    fn enter_nesting(&mut self) -> Result<()> {
+        let actual = self.nesting_depth.checked_add(1).ok_or(Error::Overflow)?;
+        self.check(
+            DecodeLimit::NestingDepth,
+            actual,
+            self.limits.max_nesting_depth,
+        )?;
+        self.nesting_depth = actual;
+        self.charge_work(1)
+    }
+
+    fn leave_nesting(&mut self) {
+        self.nesting_depth = self.nesting_depth.saturating_sub(1);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Kind {
@@ -72,7 +144,8 @@ pub struct Decoder<'de> {
     in_seq_of_primitive: bool,
     path: VecDeque<&'static str>,
     in_records: bool,
-    message_max_size: Option<usize>,
+    context: DecodeContext,
+    expected_frame_payload_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -115,6 +188,7 @@ impl Default for Meta {
 
 impl<'de> Decoder<'de> {
     pub fn new(reader: &'de mut dyn Read) -> Self {
+        let limits = DecodeLimits::default();
         Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
@@ -127,12 +201,18 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
+            context: DecodeContext::new(limits, 0).expect("default decode limits are valid"),
+            expected_frame_payload_bytes: None,
         }
     }
 
-    pub(crate) fn request(reader: &'de mut dyn Read) -> Self {
-        Self {
+    pub(crate) fn request_with_limits(
+        reader: &'de mut dyn Read,
+        limits: DecodeLimits,
+        expected_frame_payload_bytes: Option<usize>,
+        initial_work_units: usize,
+    ) -> Result<Self> {
+        Ok(Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
             field: None,
@@ -144,11 +224,13 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
-        }
+            context: DecodeContext::new(limits, initial_work_units)?,
+            expected_frame_payload_bytes,
+        })
     }
 
     pub(crate) fn response(reader: &'de mut dyn Read, api_key: i16, api_version: i16) -> Self {
+        let limits = DecodeLimits::default();
         Self {
             reader,
             containers: VecDeque::with_capacity(PARSE_DEPTH),
@@ -174,8 +256,34 @@ impl<'de> Decoder<'de> {
             in_seq_of_primitive: false,
             path: VecDeque::with_capacity(PARSE_DEPTH),
             in_records: false,
-            message_max_size: None,
+            context: DecodeContext::new(limits, 0).expect("default decode limits are valid"),
+            expected_frame_payload_bytes: None,
         }
+    }
+
+    fn check_length(&self, kind: DecodeLimit, actual: usize) -> Result<()> {
+        let limit = match kind {
+            DecodeLimit::FrameBytes => self.context.limits.max_frame_bytes,
+            DecodeLimit::StringBytes => self.context.limits.max_string_bytes,
+            DecodeLimit::Bytes => self.context.limits.max_bytes,
+            DecodeLimit::SequenceElements => self.context.limits.max_sequence_elements,
+            DecodeLimit::NestingDepth => self.context.limits.max_nesting_depth,
+            DecodeLimit::TotalAllocationBytes => self.context.limits.max_total_allocation_bytes,
+            DecodeLimit::TotalWorkUnits => self.context.limits.max_total_work_units,
+        };
+        self.context.check(kind, actual, limit)
+    }
+
+    fn check_string_length(&self, length: usize) -> Result<()> {
+        self.check_length(DecodeLimit::StringBytes, length)
+    }
+
+    fn check_bytes_length(&self, length: usize) -> Result<()> {
+        self.check_length(DecodeLimit::Bytes, length)
+    }
+
+    fn check_sequence_length(&self, length: usize) -> Result<()> {
+        self.check_length(DecodeLimit::SequenceElements, length)
     }
 
     #[must_use]
@@ -448,6 +556,24 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.reader.read_exact(&mut buf)?;
         let v = i32::from_be_bytes(buf);
 
+        if let Some(actual) = self.expected_frame_payload_bytes
+            && matches!(
+                (self.containers.front(), self.field),
+                (Some(Container::Struct { name: "Frame", .. }), Some("size"))
+            )
+        {
+            let declared = usize::try_from(v).map_err(|_| Error::InvalidFrameSize(v))?;
+            self.check_length(
+                DecodeLimit::FrameBytes,
+                declared
+                    .checked_add(std::mem::size_of::<i32>())
+                    .ok_or(Error::Overflow)?,
+            )?;
+            if declared != actual {
+                return Err(Error::FrameSizeMismatch { declared, actual });
+            }
+        }
+
         debug!(
             field = self.field_name(),
             v,
@@ -587,6 +713,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.length
             .ok_or(Error::StringWithoutLength)
             .and_then(|length| {
+                self.check_string_length(length)?;
+                self.context.charge_allocation(length)?;
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
@@ -612,9 +740,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         }
 
         if let Some(length) = self.length.take() {
-            if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
-                return Err(Error::MessageMaxSizeExceeded(length));
-            }
+            self.check_string_length(length)?;
+            self.context.charge_allocation(length)?;
 
             let mut buf = vec![0u8; length];
             self.reader.read_exact(&mut buf)?;
@@ -648,6 +775,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
             usize::try_from(u32::from_be_bytes(buf))?
         };
 
+        self.check_bytes_length(length)?;
+        self.context.charge_allocation(length)?;
         let mut buf = vec![0u8; length];
         self.reader.read_exact(&mut buf)?;
         visitor.visit_bytes(&buf[..])
@@ -672,10 +801,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
             usize::try_from(u32::from_be_bytes(buf))?
         };
 
-        if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
-            return Err(Error::MessageMaxSizeExceeded(length));
-        }
-
+        self.check_bytes_length(length)?;
+        self.context.charge_allocation(length)?;
         let mut buf = vec![0u8; length];
         self.reader.read_exact(&mut buf)?;
         visitor.visit_byte_buf(buf)
@@ -865,14 +992,13 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
                 .is_some_and(|seq| seq.is_primitive())
         });
 
-        match self.length.take() {
+        self.context.enter_nesting()?;
+        let outcome = (|| match self.length.take() {
             Some(size_in_bytes) if self.in_records => {
                 debug!(size_in_bytes);
 
-                if size_in_bytes > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
-                    return Err(Error::MessageMaxSizeExceeded(size_in_bytes));
-                }
-
+                self.check_bytes_length(size_in_bytes)?;
+                self.context.charge_allocation(size_in_bytes)?;
                 let mut buf = vec![0u8; size_in_bytes];
                 self.reader.read_exact(&mut buf)?;
                 let outcome = visitor.visit_seq(Batch::new(Bytes::from(buf)));
@@ -882,11 +1008,21 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
             }
 
             otherwise => {
+                if let Some(length) = otherwise {
+                    self.check_sequence_length(length)?;
+                    self.context.charge_allocation(
+                        length
+                            .checked_mul(std::mem::size_of::<usize>())
+                            .ok_or(Error::Overflow)?,
+                    )?;
+                }
                 let outcome = visitor.visit_seq(Seq::new(self, otherwise));
                 self.in_seq_of_primitive = false;
                 outcome
             }
-        }
+        })();
+        self.context.leave_nesting();
+        outcome
     }
 
     fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
@@ -936,6 +1072,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
     {
         debug!(r#struct = name, ?fields);
 
+        self.context.enter_nesting()?;
         self.containers
             .push_front(Container::Struct { name, fields });
 
@@ -980,6 +1117,7 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         };
 
         _ = self.containers.pop_front();
+        self.context.leave_nesting();
 
         outcome
     }
@@ -995,12 +1133,14 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
     {
         debug!(r#enum = name);
 
+        self.context.enter_nesting()?;
         self.containers
             .push_front(Container::Enum { name, variants });
 
         let outcome = visitor.visit_enum(Enum::new(self, name));
 
         _ = self.containers.pop_front();
+        self.context.leave_nesting();
         outcome
     }
 
@@ -1389,11 +1529,15 @@ impl<'de> SeqAccess<'de> for Seq<'de, '_> {
             Some(0) => Ok(None),
 
             Some(length) => {
+                self.de.context.charge_work(1)?;
                 _ = self.length.replace(length - 1);
                 seed.deserialize(&mut *self.de).map(Some)
             }
 
-            None => seed.deserialize(&mut *self.de).map(Some),
+            None => {
+                self.de.context.charge_work(1)?;
+                seed.deserialize(&mut *self.de).map(Some)
+            }
         }
     }
 }
@@ -1424,6 +1568,7 @@ impl<'de> SeqAccess<'de> for Struct<'de, '_> {
     where
         T: DeserializeSeed<'de>,
     {
+        self.de.context.charge_work(1)?;
         let field = self.fields[self.index];
         self.de.field = Some(field);
         self.index += 1;

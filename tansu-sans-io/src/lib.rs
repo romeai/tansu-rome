@@ -159,6 +159,96 @@ pub trait MaximumAllocationSize {
     fn maximum_allocation_size(&self) -> Result<usize>;
 }
 
+/// The resource whose configured decoding limit was exceeded.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DecodeLimit {
+    /// Bytes in one complete length-prefixed Kafka frame.
+    FrameBytes,
+    /// Bytes in one decoded Kafka string.
+    StringBytes,
+    /// Bytes in one decoded Kafka bytes or records field.
+    Bytes,
+    /// Elements in one decoded Kafka array.
+    SequenceElements,
+    /// Nested serde containers in one decoded request.
+    NestingDepth,
+    /// Decoder-visible bytes charged for length-delimited values and sequence storage.
+    TotalAllocationBytes,
+    /// Input bytes and structural visits performed during one decode.
+    TotalWorkUnits,
+}
+
+/// Resource limits applied while decoding a complete Kafka request frame.
+///
+/// The default frame limit matches Kafka's 100 MiB default broker request limit. The other
+/// defaults allow any single value to occupy that frame while bounding collections and aggregate
+/// decoder work. Applications accepting untrusted traffic should normally pass an explicit value
+/// to [`Frame::request_from_bytes_with_limits`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DecodeLimits {
+    /// Maximum bytes in the complete frame, including its four-byte length prefix.
+    pub max_frame_bytes: usize,
+    /// Maximum UTF-8 bytes in one string.
+    pub max_string_bytes: usize,
+    /// Maximum bytes in one bytes or records field.
+    pub max_bytes: usize,
+    /// Maximum elements declared by one array.
+    pub max_sequence_elements: usize,
+    /// Maximum nested serde containers.
+    pub max_nesting_depth: usize,
+    /// Maximum aggregate decoder-visible allocation charge.
+    ///
+    /// This includes length-delimited buffers and a pointer-sized charge for every declared
+    /// sequence element. Allocations inside serde-generated conversion code are not observable by
+    /// the decoder, so callers must also use `max_sequence_elements` as the hard collection bound.
+    pub max_total_allocation_bytes: usize,
+    /// Maximum aggregate input-byte and structural-visit work units.
+    pub max_total_work_units: usize,
+}
+
+impl DecodeLimits {
+    /// Validate limits required to inspect a Kafka frame prefix.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_frame_bytes < size_of::<i32>() {
+            return Err(Error::InvalidDecodeLimits(
+                "max_frame_bytes must accommodate the four-byte frame prefix",
+            ));
+        }
+        if self.max_total_work_units < size_of::<i32>() {
+            return Err(Error::InvalidDecodeLimits(
+                "max_total_work_units must accommodate the four-byte frame prefix",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        /// Kafka's default `socket.request.max.bytes`, including the frame prefix.
+        const DEFAULT_MAX_FRAME_BYTES: usize = 100 * 1024 * 1024;
+        /// A conservative cap on the number of elements in one protocol array.
+        const DEFAULT_MAX_SEQUENCE_ELEMENTS: usize = 1_000_000;
+        /// More than the deepest structure in the generated Kafka schemas.
+        const DEFAULT_MAX_NESTING_DEPTH: usize = 64;
+        /// Allows one frame-sized input plus one frame-sized owned decoded value.
+        const DEFAULT_MAX_TOTAL_ALLOCATION_BYTES: usize = 2 * DEFAULT_MAX_FRAME_BYTES;
+        /// Allows reading one frame and visiting a bounded number of generated fields/elements.
+        const DEFAULT_MAX_TOTAL_WORK_UNITS: usize =
+            2 * DEFAULT_MAX_FRAME_BYTES + DEFAULT_MAX_SEQUENCE_ELEMENTS;
+
+        Self {
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_string_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_sequence_elements: DEFAULT_MAX_SEQUENCE_ELEMENTS,
+            max_nesting_depth: DEFAULT_MAX_NESTING_DEPTH,
+            max_total_allocation_bytes: DEFAULT_MAX_TOTAL_ALLOCATION_BYTES,
+            max_total_work_units: DEFAULT_MAX_TOTAL_WORK_UNITS,
+        }
+    }
+}
+
 impl<T> MaximumAllocationSize for T
 where
     T: ByteSize,
@@ -337,6 +427,17 @@ pub enum Error {
     InvalidOpType(i8),
     InvalidScramMechanism(i8),
     Io(Arc<io::Error>),
+    DecodeLimitExceeded {
+        kind: DecodeLimit,
+        limit: usize,
+        actual: usize,
+    },
+    FrameSizeMismatch {
+        declared: usize,
+        actual: usize,
+    },
+    InvalidDecodeLimits(&'static str),
+    InvalidFrameSize(i32),
     Message(String),
     MessageMaxSizeExceeded(usize),
     NoSuchField(&'static str),
@@ -588,10 +689,44 @@ impl Frame {
     /// deserialize bytes into an API request frame
     #[instrument(skip_all)]
     pub fn request_from_bytes(encoded: impl Buf) -> Result<Frame> {
+        Self::request_from_bytes_with_limits(encoded, DecodeLimits::default())
+    }
+
+    /// Deserialize one complete length-prefixed API request frame under explicit resource limits.
+    ///
+    /// Unlike a stream decoder, this entry point requires exactly one frame: the signed length
+    /// prefix must equal the remaining input length. Length-delimited values and arrays are checked
+    /// before allocation or traversal.
+    #[instrument(skip_all)]
+    pub fn request_from_bytes_with_limits(
+        encoded: impl Buf,
+        limits: DecodeLimits,
+    ) -> Result<Frame> {
         let start = SystemTime::now();
+        limits.validate()?;
+
+        let frame_bytes = encoded.remaining();
+        if frame_bytes < size_of::<i32>() {
+            return Err(Error::FrameSizeMismatch {
+                declared: 0,
+                actual: frame_bytes.saturating_sub(size_of::<i32>()),
+            });
+        }
+        if frame_bytes > limits.max_frame_bytes {
+            return Err(Error::DecodeLimitExceeded {
+                kind: DecodeLimit::FrameBytes,
+                limit: limits.max_frame_bytes,
+                actual: frame_bytes,
+            });
+        }
 
         let mut reader = encoded.reader();
-        let mut deserializer = Decoder::request(&mut reader);
+        let mut deserializer = Decoder::request_with_limits(
+            &mut reader,
+            limits,
+            Some(frame_bytes - size_of::<i32>()),
+            frame_bytes,
+        )?;
         Frame::deserialize(&mut deserializer)
             .inspect(|frame| debug!(?frame, elapsed_millis = Self::elapsed_millis(start)))
     }
