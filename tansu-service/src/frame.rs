@@ -738,3 +738,26 @@ impl<F> ResponseService<F> {
         Self { response }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use rama::Layer as _;
+    use rsasl::config::SASLConfig;
+
+    use super::{BytesFrameLayer, BytesFrameService};
+
+    #[test]
+    fn bytes_frame_layer_creates_fresh_authentication_per_service() {
+        let sasl_config =
+            SASLConfig::with_credentials(None, "principal".to_owned(), "password".to_owned())
+                .expect("SASL configuration");
+        let layer = BytesFrameLayer::default().with_sasl_config(Some(sasl_config));
+
+        let first: BytesFrameService<()> = layer.layer(());
+        let second: BytesFrameService<()> = layer.layer(());
+
+        let first = first.af.expect("authentication state");
+        let second = second.af.expect("authentication state");
+        assert!(!std::sync::Arc::ptr_eq(&first.v0, &second.v0));
+    }
+}
