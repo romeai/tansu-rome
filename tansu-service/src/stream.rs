@@ -12,14 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    error::{self},
-    fmt::Debug,
-    io,
-    marker::PhantomData,
-    mem::size_of,
-    time::SystemTime,
-};
+use std::{fmt::Debug, io, marker::PhantomData, mem::size_of, net::SocketAddr, time::SystemTime};
 
 use bytes::Bytes;
 use nanoid::nanoid;
@@ -106,7 +99,65 @@ impl FrameLength {
     }
 }
 
-/// A [`Layer`] that listens for TCP connections
+/// The addresses associated with an accepted TCP connection.
+///
+/// A [`TcpListenerService`] passes this value to its make-connection service
+/// exactly once per accepted socket. The returned service then owns that
+/// socket's protocol lifetime.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectionInfo {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+}
+
+impl ConnectionInfo {
+    /// Return the address on which this connection was accepted.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Return the remote address of this connection.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+}
+
+/// A make-connection service that clones one connection service per socket.
+///
+/// [`TcpListenerLayer`] uses this adapter to preserve its convenient layering
+/// API. Applications that need connection-local state can instead construct a
+/// [`TcpListenerService`] with their own `Service<State, ConnectionInfo>`.
+#[derive(Clone, Debug)]
+pub struct CloneConnectionService<S> {
+    inner: S,
+}
+
+impl<S> CloneConnectionService<S> {
+    /// Create an adapter that clones `inner` for every accepted connection.
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<State, S> Service<State, ConnectionInfo> for CloneConnectionService<S>
+where
+    S: Clone + Send + Sync + 'static,
+    State: Send + Sync + 'static,
+{
+    type Response = S;
+    type Error = Error;
+
+    async fn serve(
+        &self,
+        _ctx: Context<State>,
+        _req: ConnectionInfo,
+    ) -> Result<Self::Response, Self::Error> {
+        Ok(self.inner.clone())
+    }
+}
+
+/// A [`Layer`] that listens for TCP connections.
 #[derive(Clone, Debug, Default)]
 pub struct TcpListenerLayer {
     cancellation: CancellationToken,
@@ -119,34 +170,52 @@ impl TcpListenerLayer {
 }
 
 impl<S> Layer<S> for TcpListenerLayer {
-    type Service = TcpListenerService<S>;
+    type Service = TcpListenerService<CloneConnectionService<S>>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            cancellation: self.cancellation.clone(),
-            inner,
+        Self::Service::new(
+            self.cancellation.clone(),
+            CloneConnectionService::new(inner),
+        )
+    }
+}
+
+/// A reusable TCP listener runtime.
+///
+/// `M` is a Rama `Service<State, ConnectionInfo>` which creates one service
+/// for each accepted socket. The listener owns all spawned connection tasks,
+/// reaps completed tasks while it is running, and aborts and reaps outstanding
+/// tasks when its cancellation token is cancelled.
+#[derive(Clone)]
+pub struct TcpListenerService<M> {
+    cancellation: CancellationToken,
+    make_connection: M,
+}
+
+impl<M> TcpListenerService<M> {
+    /// Create a listener runtime using `make_connection` as its per-socket
+    /// service factory.
+    pub fn new(cancellation: CancellationToken, make_connection: M) -> Self {
+        Self {
+            cancellation,
+            make_connection,
         }
     }
 }
 
-/// A [`Service`] that listens for TCP connections
-#[derive(Clone, Default)]
-pub struct TcpListenerService<S> {
-    cancellation: CancellationToken,
-    inner: S,
-}
-
-impl<S> Debug for TcpListenerService<S> {
+impl<M> Debug for TcpListenerService<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(TcpListenerService)).finish()
     }
 }
 
-impl<State, S> Service<State, TcpListener> for TcpListenerService<S>
+impl<State, M, S> Service<State, TcpListener> for TcpListenerService<M>
 where
-    S: Service<State, TcpStream> + Clone,
+    M: Service<State, ConnectionInfo, Response = S>,
+    M::Error: Debug,
+    S: Service<State, TcpStream>,
     S::Response: Debug,
-    S::Error: error::Error,
+    S::Error: Debug + From<io::Error>,
     State: Clone + Send + Sync + 'static,
 {
     type Response = ();
@@ -158,43 +227,51 @@ where
         ctx: Context<State>,
         req: TcpListener,
     ) -> Result<Self::Response, Self::Error> {
-        let mut set = JoinSet::new();
+        let mut connections = JoinSet::new();
 
         loop {
             tokio::select! {
-                Ok((stream, addr)) = req.accept() => {
-                    debug!(?req, ?stream, %addr);
+                accepted = req.accept() => {
+                    let (stream, peer_addr) = accepted?;
+                    let connection = ConnectionInfo {
+                        local_addr: stream.local_addr()?,
+                        peer_addr,
+                    };
+                    debug!(?connection);
 
-                    let service = self.inner.clone();
-                    let ctx = ctx.clone();
+                    let service = match self
+                        .make_connection
+                        .serve(ctx.clone(), connection)
+                        .await
+                    {
+                        Ok(service) => service,
+                        Err(error) => {
+                            error!(?connection, ?error, "unable to construct connection service");
+                            continue;
+                        }
+                    };
+                    let connection_ctx = ctx.clone();
 
-                    let handle = set.spawn(async move {
-                            match service.serve(ctx, stream).await {
-                                Err(error) => {
-                                    debug!(%addr, %error);
-                                },
-
-                                Ok(response) => {
-                                    debug!(%addr, ?response)
-                                }
+                    let _connection_task = connections.spawn(async move {
+                        match service.serve(connection_ctx, stream).await {
+                            Err(error) => debug!(?connection, ?error),
+                            Ok(response) => debug!(?connection, ?response),
                         }
                     });
-
-                    debug!(?handle);
-                    continue;
                 }
 
-                v = set.join_next(), if !set.is_empty() => {
-                    debug!(?v);
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    debug!(?joined);
                 }
 
-                cancelled = self.cancellation.cancelled() => {
-                    debug!(?cancelled);
+                () = self.cancellation.cancelled() => {
+                    debug!("TCP listener cancellation requested");
                     break;
                 }
             }
         }
 
+        connections.shutdown().await;
         Ok(())
     }
 }
@@ -538,14 +615,75 @@ mod tests {
     };
 
     use rama::{Context, Layer as _, Service as _};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
+        net::{TcpListener, TcpStream},
+        sync::{mpsc, oneshot},
+        time::{Duration, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
 
-    use super::{FrameLength, TcpBytesLayer, TcpContext};
+    use super::{ConnectionInfo, FrameLength, TcpBytesLayer, TcpContext, TcpListenerService};
     use crate::Error;
 
     #[derive(Clone, Debug)]
     struct EchoService {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct MakeConnection {
+        calls: Arc<AtomicUsize>,
+        started: mpsc::UnboundedSender<ConnectionInfo>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl rama::Service<(), ConnectionInfo> for MakeConnection {
+        type Response = PendingConnection;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            connection: ConnectionInfo,
+        ) -> Result<Self::Response, Self::Error> {
+            _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PendingConnection {
+                connection,
+                started: self.started.clone(),
+                drops: self.drops.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingConnection {
+        connection: ConnectionInfo,
+        started: mpsc::UnboundedSender<ConnectionInfo>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl rama::Service<(), TcpStream> for PendingConnection {
+        type Response = ();
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            _stream: TcpStream,
+        ) -> Result<Self::Response, Self::Error> {
+            struct DropCount(Arc<AtomicUsize>);
+
+            impl Drop for DropCount {
+                fn drop(&mut self) {
+                    _ = self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let _drop_count = DropCount(self.drops.clone());
+            self.started.send(self.connection).unwrap();
+            std::future::pending().await
+        }
     }
 
     impl rama::Service<(), bytes::Bytes> for EchoService {
@@ -681,5 +819,53 @@ mod tests {
 
         client.shutdown().await.unwrap();
         assert!(matches!(server.await.unwrap(), Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn listener_builds_each_connection_once_and_reaps_on_cancellation() {
+        let cancellation = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let make_connection = MakeConnection {
+            calls: calls.clone(),
+            started: started_tx,
+            drops: drops.clone(),
+        };
+        let service = TcpListenerService::new(cancellation.clone(), make_connection);
+        let (finished_tx, finished_rx) = oneshot::channel();
+
+        let _listener_task = tokio::spawn(async move {
+            let result = service.serve(Context::default(), listener).await;
+            finished_tx.send(result).unwrap();
+        });
+
+        let first = TcpStream::connect(local_addr).await.unwrap();
+        let second = TcpStream::connect(local_addr).await.unwrap();
+        let first_info = timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second_info = timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(local_addr, first_info.local_addr());
+        assert_eq!(local_addr, second_info.local_addr());
+        assert_eq!(2, calls.load(Ordering::SeqCst));
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(2, drops.load(Ordering::SeqCst));
+
+        drop((first, second));
     }
 }
