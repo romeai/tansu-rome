@@ -17,6 +17,7 @@ use std::{
     fmt::Debug,
     io,
     marker::PhantomData,
+    mem::size_of,
     time::SystemTime,
 };
 
@@ -32,9 +33,78 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 
-use crate::{
-    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
-};
+use crate::{BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE};
+
+/// Bytes occupied by Kafka's signed frame-length prefix.
+const FRAME_LENGTH_PREFIX_BYTES: usize = size_of::<i32>();
+
+/// Minimum Kafka request body: API key, API version, and correlation ID.
+const MINIMUM_REQUEST_BODY_BYTES: usize = size_of::<i16>() * 2 + size_of::<i32>();
+
+/// Minimum Kafka response body: correlation ID.
+const MINIMUM_RESPONSE_BODY_BYTES: usize = size_of::<i32>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameLength {
+    declared: i32,
+    body: usize,
+    complete: usize,
+}
+
+impl FrameLength {
+    fn request(
+        encoded: [u8; FRAME_LENGTH_PREFIX_BYTES],
+        maximum: Option<usize>,
+    ) -> Result<Self, Error> {
+        Self::bounded(encoded, maximum)?.with_minimum(MINIMUM_REQUEST_BODY_BYTES)
+    }
+
+    fn response(encoded: [u8; FRAME_LENGTH_PREFIX_BYTES]) -> Result<Self, Error> {
+        Self::bounded(encoded, None)?.with_minimum(MINIMUM_RESPONSE_BODY_BYTES)
+    }
+
+    /// Validate the common length prefix without assuming the payload's framing grammar.
+    ///
+    /// Kafka request frames require a fixed API/version/correlation head, but SASL handshake v0
+    /// tokens are only length-prefixed and may be shorter. Connection-local framing state chooses
+    /// the grammar after this peer-controlled signed value is checked for conversion, bounds,
+    /// prefix addition, allocation, and reading.
+    fn bounded(
+        encoded: [u8; FRAME_LENGTH_PREFIX_BYTES],
+        maximum: Option<usize>,
+    ) -> Result<Self, Error> {
+        let declared = i32::from_be_bytes(encoded);
+        let body = usize::try_from(declared).map_err(|_| Error::InvalidFrameLength { declared })?;
+
+        if let Some(maximum) = maximum
+            && body > maximum
+        {
+            return Err(Error::FrameTooBig {
+                declared: body,
+                maximum,
+            });
+        }
+
+        body.checked_add(FRAME_LENGTH_PREFIX_BYTES)
+            .map(|complete| Self {
+                declared,
+                body,
+                complete,
+            })
+            .ok_or(Error::FrameLengthOverflow { declared })
+    }
+
+    fn with_minimum(self, minimum: usize) -> Result<Self, Error> {
+        if self.body < minimum {
+            Err(Error::FrameTooShort {
+                declared: self.body,
+                minimum,
+            })
+        } else {
+            Ok(self)
+        }
+    }
+}
 
 /// A [`Layer`] that listens for TCP connections
 #[derive(Clone, Debug, Default)]
@@ -142,6 +212,7 @@ impl TcpContext {
         Self { cluster_id, ..self }
     }
 
+    /// Set the maximum Kafka request body size, excluding the four-byte frame prefix.
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
         Self {
             maximum_frame_size,
@@ -226,12 +297,15 @@ impl Service<TcpStream, Bytes> for BytesTcpService {
         stream.write_all(&req[..]).await?;
         BYTES_SENT.add(req.len() as u64, &[]);
 
-        let mut size = [0u8; 4];
+        let mut size = [0u8; FRAME_LENGTH_PREFIX_BYTES];
         _ = stream.read_exact(&mut size).await?;
 
-        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)];
+        let length = FrameLength::response(size)?;
+        let mut buffer: Vec<u8> = vec![0u8; length.complete];
         buffer[0..size.len()].copy_from_slice(&size[..]);
-        _ = stream.read_exact(&mut buffer[4..]).await?;
+        _ = stream
+            .read_exact(&mut buffer[FRAME_LENGTH_PREFIX_BYTES..])
+            .await?;
         BYTES_RECEIVED.add(buffer.len() as u64, &[]);
 
         Ok(Bytes::from(buffer))
@@ -287,37 +361,31 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
-    ) -> Result<[u8; 4], S::Error>
+    ) -> Result<FrameLength, S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut size = [0u8; 4];
+        let mut size = [0u8; FRAME_LENGTH_PREFIX_BYTES];
 
         _ = req
             .read_exact(&mut size)
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        if maximum_frame_size
-            .is_some_and(|maximum_frame_size| maximum_frame_size > frame_length(size))
-        {
-            return Err(Into::into(Error::FrameTooBig(frame_length(size))));
-        } else {
-            Ok(size)
-        }
+        FrameLength::request(size, maximum_frame_size).map_err(Into::into)
     }
 
     #[instrument(skip_all)]
-    async fn read<R>(&self, req: &mut R, size: [u8; 4]) -> Result<Bytes, S::Error>
+    async fn read<R>(&self, req: &mut R, length: FrameLength) -> Result<Bytes, S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut request: Vec<u8> = vec![0u8; frame_length(size)];
+        let mut request: Vec<u8> = vec![0u8; length.complete];
 
-        request[0..size.len()].copy_from_slice(&size[..]);
+        request[0..FRAME_LENGTH_PREFIX_BYTES].copy_from_slice(&length.declared.to_be_bytes());
 
         _ = req
-            .read_exact(&mut request[4..])
+            .read_exact(&mut request[FRAME_LENGTH_PREFIX_BYTES..])
             .await
             .inspect_err(|err| error!(?err))?;
         BYTES_RECEIVED.add(request.len() as u64, &[]);
@@ -372,8 +440,8 @@ where
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let size = self.wait(req, maximum_frame_size).await?;
-        let request = self.read(req, size).await?;
+        let length = self.wait(req, maximum_frame_size).await?;
+        let request = self.read(req, length).await?;
         let response = self.process(attributes, ctx, request).await?;
         self.write(req, response).await
     }
@@ -459,5 +527,159 @@ where
             .serve(ctx, req)
             .await
             .inspect(|response| debug!(response = ?&response[..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use rama::{Context, Layer as _, Service as _};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+
+    use super::{FrameLength, TcpBytesLayer, TcpContext};
+    use crate::Error;
+
+    #[derive(Clone, Debug)]
+    struct EchoService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl rama::Service<(), bytes::Bytes> for EchoService {
+        type Response = bytes::Bytes;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            req: bytes::Bytes,
+        ) -> Result<Self::Response, Self::Error> {
+            _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(req)
+        }
+    }
+
+    #[test]
+    fn request_length_rejects_negative_declaration() {
+        assert!(matches!(
+            FrameLength::request((-1_i32).to_be_bytes(), Some(8)),
+            Err(Error::InvalidFrameLength { declared: -1 })
+        ));
+    }
+
+    #[test]
+    fn request_length_rejects_structurally_short_declaration() {
+        assert!(matches!(
+            FrameLength::request(7_i32.to_be_bytes(), Some(8)),
+            Err(Error::FrameTooShort {
+                declared: 7,
+                minimum: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn common_length_validation_accepts_short_opaque_tokens() {
+        assert_eq!(
+            FrameLength {
+                declared: 1,
+                body: 1,
+                complete: 5,
+            },
+            FrameLength::bounded(1_i32.to_be_bytes(), Some(1)).unwrap()
+        );
+        assert!(matches!(
+            FrameLength::request(1_i32.to_be_bytes(), Some(1)),
+            Err(Error::FrameTooShort {
+                declared: 1,
+                minimum: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn request_length_enforces_body_byte_limit_boundaries() {
+        let maximum = 9;
+
+        assert_eq!(
+            FrameLength {
+                declared: 8,
+                body: 8,
+                complete: 12,
+            },
+            FrameLength::request(8_i32.to_be_bytes(), Some(maximum)).unwrap()
+        );
+        assert_eq!(
+            FrameLength {
+                declared: 9,
+                body: 9,
+                complete: 13,
+            },
+            FrameLength::request(9_i32.to_be_bytes(), Some(maximum)).unwrap()
+        );
+        assert!(matches!(
+            FrameLength::request(10_i32.to_be_bytes(), Some(maximum)),
+            Err(Error::FrameTooBig {
+                declared: 10,
+                maximum: 9,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_length_never_enters_inner_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService {
+            calls: calls.clone(),
+        });
+        let (mut client, server) = duplex(32);
+        client.write_all(&10_i32.to_be_bytes()).await.unwrap();
+
+        let result = service
+            .serve(
+                Context::with_state(TcpContext::default().maximum_frame_size(Some(9))),
+                server,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::FrameTooBig {
+                declared: 10,
+                maximum: 9,
+            })
+        ));
+        assert_eq!(0, calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_round_trip_is_byte_identical() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService {
+            calls: calls.clone(),
+        });
+        let (mut client, server) = duplex(64);
+        let request = [0, 0, 0, 8, 0, 3, 0, 1, 0, 0, 0, 42];
+
+        let server = tokio::spawn(async move {
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(8))),
+                    server,
+                )
+                .await
+        });
+
+        client.write_all(&request).await.unwrap();
+        let mut response = [0; 12];
+        _ = client.read_exact(&mut response).await.unwrap();
+        assert_eq!(request, response);
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+
+        client.shutdown().await.unwrap();
+        assert!(matches!(server.await.unwrap(), Err(Error::Io(_))));
     }
 }

@@ -23,7 +23,7 @@ use tansu_service::{
 use tansu_storage::Storage;
 use tracing::debug;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use crate::{DEFAULT_MAXIMUM_FRAME_SIZE, Error, Result, coordinator::group::Coordinator};
 
 pub mod auth;
 pub mod coordinator;
@@ -42,6 +42,29 @@ where
     S: Storage + Clone,
     C: Coordinator,
 {
+    services_with_maximum_frame_size(
+        cluster_id,
+        coordinator,
+        storage,
+        sasl_config,
+        DEFAULT_MAXIMUM_FRAME_SIZE,
+    )
+}
+
+/// Construct broker services with a maximum Kafka request body size.
+///
+/// `maximum_frame_size` excludes the four-byte Kafka frame prefix.
+pub fn services_with_maximum_frame_size<C, S>(
+    cluster_id: &str,
+    coordinator: C,
+    storage: S,
+    sasl_config: Option<Arc<SASLConfig>>,
+    maximum_frame_size: usize,
+) -> Result<TcpRouteFrame, Error>
+where
+    S: Storage + Clone,
+    C: Coordinator,
+{
     storage::services(FrameRouteService::<(), Error>::builder(), storage)
         .inspect(|builder| debug!(?builder))
         .and_then(|builder| {
@@ -51,7 +74,11 @@ where
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
             (
-                TcpContextLayer::new(TcpContext::default().cluster_id(Some(cluster_id.into()))),
+                TcpContextLayer::new(
+                    TcpContext::default()
+                        .cluster_id(Some(cluster_id.into()))
+                        .maximum_frame_size(Some(maximum_frame_size)),
+                ),
                 TcpBytesLayer::default(),
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
             )

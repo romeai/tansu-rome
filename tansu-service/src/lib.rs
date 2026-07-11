@@ -278,7 +278,10 @@ pub use stream::{
 pub enum Error {
     Auth(#[from] tansu_auth::Error),
     DuplicateRoute(i16),
-    FrameTooBig(usize),
+    FrameLengthOverflow { declared: i32 },
+    FrameTooBig { declared: usize, maximum: usize },
+    FrameTooShort { declared: usize, minimum: usize },
+    InvalidFrameLength { declared: i32 },
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
@@ -314,10 +317,6 @@ impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
     }
-}
-
-fn frame_length(encoded: [u8; 4]) -> usize {
-    i32::from_be_bytes(encoded) as usize + encoded.len()
 }
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
