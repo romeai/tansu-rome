@@ -381,4 +381,13 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn cloned_router_shares_the_immutable_route_table() -> Result<(), Error> {
+        let route = FrameRouteService::<(), Error>::builder().build()?;
+        let cloned = route.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&route.routes, &cloned.routes));
+        Ok(())
+    }
 }

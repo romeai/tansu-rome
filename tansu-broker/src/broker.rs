@@ -18,7 +18,7 @@ use crate::{
     CancelKind, DEFAULT_MAXIMUM_FRAME_SIZE, Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
     otel,
-    service::services_with_maximum_frame_size,
+    service::{connection_service, routes},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -241,6 +241,8 @@ where
         .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
         .inspect_err(|err| error!(?err, %self.advertised_listener))?;
 
+        let route = routes(self.groups.clone(), self.storage.clone())?;
+
         let mut interval =
             time::interval(self.maintenance_interval.unwrap_or(Duration::from_mins(10)));
 
@@ -316,13 +318,12 @@ where
 
                     stream.set_nodelay(true)?;
 
-                    let service = services_with_maximum_frame_size(
+                    let service = connection_service(
                         self.cluster_id.as_str(),
-                        self.groups.clone(),
-                        self.storage.clone(),
+                        route.clone(),
                         self.sasl_config.clone(),
                         self.maximum_frame_size,
-                    )?;
+                    );
 
                     let handle = set.spawn(async move {
                             match service.serve(c, stream).await {
