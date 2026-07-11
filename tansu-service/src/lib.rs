@@ -274,13 +274,15 @@ pub use stream::{
     AdmittedTcpBytesService, BytesLayer, BytesService, BytesTcpService, CloneConnectionService,
     ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, Reply, RequestAdmissionError,
     RequestHead, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
-    TcpListenerError, TcpListenerLayer, TcpListenerService,
+    TcpKeepaliveConfig, TcpListenerError, TcpListenerLayer, TcpListenerService, TcpTransportConfig,
+    TcpTransportConfigError,
 };
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Auth(#[from] tansu_auth::Error),
     DuplicateRoute(i16),
+    ConnectionIdleTimeout { timeout: Duration },
     FrameLengthOverflow { declared: i32 },
     FrameTooBig { declared: usize, maximum: usize },
     FrameTooShort { declared: usize, minimum: usize },
