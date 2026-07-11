@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use std::{
-    error, fmt::Debug, io, marker::PhantomData, mem::size_of, net::SocketAddr, num::NonZeroUsize,
-    sync::Arc, time::SystemTime,
+    collections::HashMap, error, fmt::Debug, io, marker::PhantomData, mem::size_of,
+    net::SocketAddr, num::NonZeroUsize, sync::Arc, time::SystemTime,
 };
 
 use bytes::Bytes;
@@ -28,7 +28,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
     sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
+    task::{Id, JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
@@ -334,9 +334,26 @@ impl<M, P> Debug for TcpListenerService<M, P> {
 }
 
 impl<M, P> TcpListenerService<M, P> {
+    fn reap<State>(joined: Result<(Id, ()), JoinError>, leases: &mut HashMap<Id, P::Guard>)
+    where
+        P: Policy<State, AcceptIntent>,
+    {
+        let id = match &joined {
+            Ok((id, ())) => *id,
+            Err(error) => error.id(),
+        };
+        let lease = leases
+            .remove(&id)
+            .expect("every listener-owned task has one connection lease");
+        drop(lease);
+        debug!(?joined);
+    }
+
     async fn admit<State>(
         &self,
         mut ctx: Context<State>,
+        connections: &mut JoinSet<()>,
+        leases: &mut HashMap<Id, P::Guard>,
     ) -> Result<Option<(Context<State>, P::Guard)>, P::Error>
     where
         P: Policy<State, AcceptIntent>,
@@ -345,9 +362,17 @@ impl<M, P> TcpListenerService<M, P> {
         let mut request = AcceptIntent;
 
         loop {
-            let result = tokio::select! {
-                result = self.policy.check(ctx, request) => result,
-                () = self.cancellation.cancelled() => return Ok(None),
+            let check = self.policy.check(ctx, request);
+            tokio::pin!(check);
+            let result = loop {
+                tokio::select! {
+                    result = &mut check => break result,
+                    joined = connections.join_next_with_id(), if !connections.is_empty() => {
+                        let joined = joined.expect("a non-empty join set has a task to reap");
+                        Self::reap::<State>(joined, leases);
+                    }
+                    () = self.cancellation.cancelled() => return Ok(None),
+                }
             };
             ctx = result.ctx;
             request = result.request;
@@ -382,34 +407,43 @@ where
         req: TcpListener,
     ) -> Result<Self::Response, Self::Error> {
         let mut connections = JoinSet::new();
+        let mut leases = HashMap::new();
 
-        'listener: loop {
-            let Some((connection_ctx, lease)) = self
-                .admit(ctx.clone())
-                .await
-                .map_err(TcpListenerError::Policy)?
+        let result = 'listener: loop {
+            let Some((connection_ctx, lease)) =
+                (match self.admit(ctx.clone(), &mut connections, &mut leases).await {
+                    Ok(admission) => admission,
+                    Err(error) => break 'listener Err(TcpListenerError::Policy(error)),
+                })
             else {
-                break;
+                break Ok(());
             };
 
             let (stream, peer_addr) = loop {
                 tokio::select! {
-                    accepted = req.accept() => break accepted?,
-                    joined = connections.join_next(), if !connections.is_empty() => {
-                        debug!(?joined);
+                    accepted = req.accept() => match accepted {
+                        Ok(accepted) => break accepted,
+                        Err(error) => break 'listener Err(TcpListenerError::Io(error)),
+                    },
+                    joined = connections.join_next_with_id(), if !connections.is_empty() => {
+                        let joined = joined.expect("a non-empty join set has a task to reap");
+                        Self::reap::<State>(joined, &mut leases);
                     }
-                    () = self.cancellation.cancelled() => break 'listener,
+                    () = self.cancellation.cancelled() => break 'listener Ok(()),
                 }
             };
             let connection = ConnectionInfo {
-                local_addr: stream.local_addr()?,
+                local_addr: match stream.local_addr() {
+                    Ok(local_addr) => local_addr,
+                    Err(error) => break 'listener Err(TcpListenerError::Io(error)),
+                },
                 peer_addr,
             };
             debug!(?connection);
 
             let service = match tokio::select! {
                 result = self.make_connection.serve(connection_ctx.clone(), connection) => result,
-                () = self.cancellation.cancelled() => break 'listener,
+                () = self.cancellation.cancelled() => break 'listener Ok(()),
             } {
                 Ok(service) => service,
                 Err(error) => {
@@ -421,17 +455,28 @@ where
                     continue;
                 }
             };
-            let _connection_task = connections.spawn(async move {
-                let _lease = lease;
+            let connection_task = connections.spawn(async move {
                 match service.serve(connection_ctx, stream).await {
                     Err(error) => debug!(?connection, ?error),
                     Ok(response) => debug!(?connection, ?response),
                 }
             });
-        }
+            assert!(
+                leases.insert(connection_task.id(), lease).is_none(),
+                "task identifiers are unique among listener-owned connections"
+            );
+        };
 
-        connections.shutdown().await;
-        Ok(())
+        connections.abort_all();
+        while let Some(joined) = connections.join_next_with_id().await {
+            Self::reap::<State>(joined, &mut leases);
+        }
+        assert!(
+            leases.is_empty(),
+            "all connection leases are released by task reaping"
+        );
+
+        result
     }
 }
 
