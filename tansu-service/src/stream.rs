@@ -340,6 +340,15 @@ where
     #[error("invalid Kafka request frame")]
     Frame(#[source] Error),
 
+    /// A bounded protocol I/O phase did not complete before its deadline.
+    #[error("Kafka {phase} exceeded its {timeout:?} deadline")]
+    Timeout {
+        /// Protocol phase which failed to make bounded progress.
+        phase: ProtocolIoPhase,
+        /// Caller-configured deadline for that phase.
+        timeout: Duration,
+    },
+
     /// Request admission explicitly aborted.
     #[error("request admission policy aborted")]
     Policy(#[source] P),
@@ -347,6 +356,32 @@ where
     /// The admitted request service failed fatally.
     #[error("admitted request service failed")]
     Service(#[source] S),
+}
+
+/// A separately bounded Kafka protocol I/O phase.
+///
+/// Admission is deliberately absent: resource-policy waits remain governed by
+/// capacity becoming available, while these phases bound work controlled by a
+/// connected peer or by a stalled socket.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ProtocolIoPhase {
+    /// The eight fixed request-header bytes after the length prefix.
+    FixedRequestHeader,
+    /// The admitted request body following the twelve-byte request head.
+    RequestBody,
+    /// Writing and flushing one complete protocol response.
+    ResponseWrite,
+}
+
+impl std::fmt::Display for ProtocolIoPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let description = match self {
+            Self::FixedRequestHeader => "fixed request header read",
+            Self::RequestBody => "request body read",
+            Self::ResponseWrite => "response write and flush",
+        };
+        formatter.write_str(description)
+    }
 }
 
 impl RequestHead {
@@ -539,6 +574,9 @@ pub struct TcpTransportConfig {
     send_buffer_size: Option<NonZeroUsize>,
     keepalive: Option<TcpKeepaliveConfig>,
     idle_timeout: Option<Duration>,
+    request_head_timeout: Option<Duration>,
+    body_read_timeout: Option<Duration>,
+    response_write_timeout: Option<Duration>,
 }
 
 impl TcpTransportConfig {
@@ -592,6 +630,37 @@ impl TcpTransportConfig {
         Ok(self)
     }
 
+    /// Bound reading the fixed request-header bytes after the length prefix.
+    pub fn with_request_head_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, TcpTransportConfigError> {
+        self.request_head_timeout = Some(checked_duration("fixed request header", timeout)?);
+        Ok(self)
+    }
+
+    /// Bound reading a request body after its fixed header has been validated.
+    ///
+    /// In the admitted runtime this clock begins only after the request policy
+    /// grants a lease, so time spent waiting for capacity cannot consume a
+    /// peer-controlled I/O deadline.
+    pub fn with_body_read_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, TcpTransportConfigError> {
+        self.body_read_timeout = Some(checked_duration("request body read", timeout)?);
+        Ok(self)
+    }
+
+    /// Bound writing and flushing one complete response frame.
+    pub fn with_response_write_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, TcpTransportConfigError> {
+        self.response_write_timeout = Some(checked_duration("response write", timeout)?);
+        Ok(self)
+    }
+
     /// Return the requested `TCP_NODELAY` setting.
     pub fn nodelay(&self) -> Option<bool> {
         self.nodelay
@@ -615,6 +684,32 @@ impl TcpTransportConfig {
     /// Return the idle period allowed while awaiting the next frame prefix.
     pub fn idle_timeout(&self) -> Option<Duration> {
         self.idle_timeout
+    }
+
+    /// Return the deadline for the fixed request header after its length prefix.
+    pub fn request_head_timeout(&self) -> Option<Duration> {
+        self.request_head_timeout
+    }
+
+    /// Return the deadline for reading a validated request body.
+    pub fn body_read_timeout(&self) -> Option<Duration> {
+        self.body_read_timeout
+    }
+
+    /// Return the deadline for writing and flushing one response.
+    pub fn response_write_timeout(&self) -> Option<Duration> {
+        self.response_write_timeout
+    }
+}
+
+fn checked_duration(
+    option: &'static str,
+    duration: Duration,
+) -> Result<Duration, TcpTransportConfigError> {
+    if duration.is_zero() {
+        Err(TcpTransportConfigError::ZeroDuration { option })
+    } else {
+        Ok(duration)
     }
 }
 
@@ -1403,6 +1498,12 @@ enum ReadHeadError {
 
     #[error("invalid Kafka request head")]
     Frame(#[from] Error),
+
+    #[error("Kafka {phase} exceeded its {timeout:?} deadline")]
+    Timeout {
+        phase: ProtocolIoPhase,
+        timeout: Duration,
+    },
 }
 
 impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
@@ -1410,14 +1511,14 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         &self,
         stream: &mut R,
         maximum_frame_size: Option<usize>,
-        idle_timeout: Option<Duration>,
+        transport: TcpTransportConfig,
     ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), ReadHeadError>
     where
         R: AsyncReadExt + Unpin,
     {
         let mut encoded = [0u8; REQUEST_HEAD_BYTES];
         let read = stream.read_exact(&mut encoded[..FRAME_LENGTH_PREFIX_BYTES]);
-        if let Some(timeout) = idle_timeout {
+        if let Some(timeout) = transport.idle_timeout() {
             _ = tokio::time::timeout(timeout, read)
                 .await
                 .map_err(|_| ReadHeadError::Frame(Error::ConnectionIdleTimeout { timeout }))??;
@@ -1433,9 +1534,17 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         // wire input.
         let length = FrameLength::request(length_prefix, maximum_frame_size)?;
 
-        _ = stream
-            .read_exact(&mut encoded[FRAME_LENGTH_PREFIX_BYTES..])
-            .await?;
+        let read = stream.read_exact(&mut encoded[FRAME_LENGTH_PREFIX_BYTES..]);
+        if let Some(timeout) = transport.request_head_timeout() {
+            _ = tokio::time::timeout(timeout, read).await.map_err(|_| {
+                ReadHeadError::Timeout {
+                    phase: ProtocolIoPhase::FixedRequestHeader,
+                    timeout,
+                }
+            })??;
+        } else {
+            _ = read.await?;
+        }
         let (head, _) = RequestHead::decode(encoded, maximum_frame_size)?;
         Ok((head, length, encoded))
     }
@@ -1466,7 +1575,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         &self,
         stream: &mut R,
         maximum_frame_size: Option<usize>,
-        idle_timeout: Option<Duration>,
+        transport: TcpTransportConfig,
         ctx: Context<State>,
     ) -> Result<(), RequestAdmissionError<P::Error, S::Error>>
     where
@@ -1478,11 +1587,14 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let (wire_head, length, encoded_head) = self
-            .read_head(stream, maximum_frame_size, idle_timeout)
+            .read_head(stream, maximum_frame_size, transport)
             .await
             .map_err(|error| match error {
                 ReadHeadError::Io(error) => RequestAdmissionError::Io(error),
                 ReadHeadError::Frame(error) => RequestAdmissionError::Frame(error),
+                ReadHeadError::Timeout { phase, timeout } => {
+                    RequestAdmissionError::Timeout { phase, timeout }
+                }
             })?;
         let (ctx, admitted_head, lease) = self
             .admit(ctx, wire_head)
@@ -1499,9 +1611,17 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
 
         let mut request = vec![0u8; length.complete];
         request[..REQUEST_HEAD_BYTES].copy_from_slice(&encoded_head);
-        _ = stream
-            .read_exact(&mut request[REQUEST_HEAD_BYTES..])
-            .await?;
+        let read = stream.read_exact(&mut request[REQUEST_HEAD_BYTES..]);
+        if let Some(timeout) = transport.body_read_timeout() {
+            _ = tokio::time::timeout(timeout, read).await.map_err(|_| {
+                RequestAdmissionError::Timeout {
+                    phase: ProtocolIoPhase::RequestBody,
+                    timeout,
+                }
+            })??;
+        } else {
+            _ = read.await?;
+        }
         BYTES_RECEIVED.add(request.len() as u64, &[]);
 
         let reply = self
@@ -1521,9 +1641,21 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         let _lease = lease;
         if let Reply::Frame(payload) = payload {
             let mut writer = BufWriter::new(stream);
-            writer.write_all(&payload).await?;
+            let write = async {
+                writer.write_all(&payload).await?;
+                writer.flush().await
+            };
+            if let Some(timeout) = transport.response_write_timeout() {
+                tokio::time::timeout(timeout, write).await.map_err(|_| {
+                    RequestAdmissionError::Timeout {
+                        phase: ProtocolIoPhase::ResponseWrite,
+                        timeout,
+                    }
+                })??;
+            } else {
+                write.await?;
+            }
             BYTES_SENT.add(payload.len() as u64, &[]);
-            writer.flush().await?;
         }
         Ok(())
     }
@@ -1547,13 +1679,11 @@ where
         mut stream: Stream,
     ) -> Result<Self::Response, Self::Error> {
         let maximum_frame_size = ctx.state().maximum_frame_size;
-        let idle_timeout = ctx
-            .get::<TcpTransportConfig>()
-            .and_then(TcpTransportConfig::idle_timeout);
+        let transport = ctx.get::<TcpTransportConfig>().copied().unwrap_or_default();
         let (ctx, _) = ctx.swap_state(State::default());
 
         loop {
-            self.request(&mut stream, maximum_frame_size, idle_timeout, ctx.clone())
+            self.request(&mut stream, maximum_frame_size, transport, ctx.clone())
                 .await?;
         }
     }
@@ -1570,7 +1700,7 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
-        idle_timeout: Option<Duration>,
+        transport: TcpTransportConfig,
     ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), S::Error>
     where
         R: AsyncReadExt + Unpin,
@@ -1578,7 +1708,7 @@ where
         let mut head = [0u8; REQUEST_HEAD_BYTES];
 
         let read = req.read_exact(&mut head[..FRAME_LENGTH_PREFIX_BYTES]);
-        if let Some(timeout) = idle_timeout {
+        if let Some(timeout) = transport.idle_timeout() {
             _ = tokio::time::timeout(timeout, read)
                 .await
                 .map_err(|_| Error::ConnectionIdleTimeout { timeout })?
@@ -1597,10 +1727,18 @@ where
             maximum_frame_size,
         )?;
 
-        _ = req
-            .read_exact(&mut head[FRAME_LENGTH_PREFIX_BYTES..])
-            .await
-            .inspect_err(|err| debug!(?err))?;
+        let read = req.read_exact(&mut head[FRAME_LENGTH_PREFIX_BYTES..]);
+        if let Some(timeout) = transport.request_head_timeout() {
+            _ = tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| Error::ProtocolIoTimeout {
+                    phase: ProtocolIoPhase::FixedRequestHeader,
+                    timeout,
+                })?
+                .inspect_err(|err| debug!(?err))?;
+        } else {
+            _ = read.await.inspect_err(|err| debug!(?err))?;
+        }
 
         RequestHead::decode(head, maximum_frame_size)
             .map(|(request_head, length)| (request_head, length, head))
@@ -1613,6 +1751,7 @@ where
         req: &mut R,
         length: FrameLength,
         head: [u8; REQUEST_HEAD_BYTES],
+        timeout: Option<Duration>,
     ) -> Result<Bytes, S::Error>
     where
         R: AsyncReadExt + Unpin,
@@ -1621,10 +1760,18 @@ where
 
         request[..REQUEST_HEAD_BYTES].copy_from_slice(&head);
 
-        _ = req
-            .read_exact(&mut request[REQUEST_HEAD_BYTES..])
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let read = req.read_exact(&mut request[REQUEST_HEAD_BYTES..]);
+        if let Some(timeout) = timeout {
+            _ = tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| Error::ProtocolIoTimeout {
+                    phase: ProtocolIoPhase::RequestBody,
+                    timeout,
+                })?
+                .inspect_err(|err| error!(?err))?;
+        } else {
+            _ = read.await.inspect_err(|err| error!(?err))?;
+        }
         BYTES_RECEIVED.add(request.len() as u64, &[]);
 
         Ok(Bytes::from(request))
@@ -1656,14 +1803,33 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn write<W>(&self, req: &mut W, frame: Bytes) -> Result<(), S::Error>
+    async fn write<W>(
+        &self,
+        req: &mut W,
+        frame: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<(), S::Error>
     where
         W: AsyncWriteExt + Unpin,
     {
         let mut w = BufWriter::new(req);
-        w.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+        let write = async {
+            w.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+            w.flush().await
+        };
+        let result: io::Result<()> = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, write)
+                .await
+                .map_err(|_| Error::ProtocolIoTimeout {
+                    phase: ProtocolIoPhase::ResponseWrite,
+                    timeout,
+                })?
+        } else {
+            write.await
+        };
+        result?;
         BYTES_SENT.add(frame.len() as u64, &[]);
-        w.flush().await.map_err(Into::into)
+        Ok(())
     }
 
     #[instrument(skip_all, fields(id = nanoid!()))]
@@ -1671,18 +1837,20 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
-        idle_timeout: Option<Duration>,
+        transport: TcpTransportConfig,
         attributes: &[KeyValue],
         ctx: Context<TcpContext>,
     ) -> Result<(), S::Error>
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let (_head, length, encoded_head) =
-            self.wait(req, maximum_frame_size, idle_timeout).await?;
-        let request = self.read(req, length, encoded_head).await?;
+        let (_head, length, encoded_head) = self.wait(req, maximum_frame_size, transport).await?;
+        let request = self
+            .read(req, length, encoded_head, transport.body_read_timeout())
+            .await?;
         let response = self.process(attributes, ctx, request).await?;
-        self.write(req, response).await
+        self.write(req, response, transport.response_write_timeout())
+            .await
     }
 }
 
@@ -1716,9 +1884,7 @@ where
         };
 
         let maximum_frame_size = ctx.state().maximum_frame_size;
-        let idle_timeout = ctx
-            .get::<TcpTransportConfig>()
-            .and_then(TcpTransportConfig::idle_timeout);
+        let transport = ctx.get::<TcpTransportConfig>().copied().unwrap_or_default();
 
         loop {
             let ctx = ctx.clone();
@@ -1727,7 +1893,7 @@ where
             self.req(
                 &mut req,
                 maximum_frame_size,
-                idle_timeout,
+                transport,
                 &attributes[..],
                 ctx,
             )
@@ -1808,9 +1974,10 @@ mod tests {
 
     use super::{
         AcceptIntent, AdmissionEvidence, AdmissionLease, AdmittedFrame, AdmittedReply,
-        ConnectionInfo, FixedConnectionPolicy, FrameLength, Reply, RequestAdmissionError,
-        RequestHead, SocketOptionTarget, TcpBytesLayer, TcpContext, TcpKeepaliveConfig,
-        TcpListenerService, TcpTransportConfig, TcpTransportConfigError, configure_admitted_socket,
+        ConnectionInfo, FixedConnectionPolicy, FrameLength, ProtocolIoPhase, Reply,
+        RequestAdmissionError, RequestHead, SocketOptionTarget, TcpBytesLayer, TcpContext,
+        TcpKeepaliveConfig, TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
+        configure_admitted_socket,
     };
     use crate::{BytesFrameLayer, Error};
 
@@ -2263,6 +2430,12 @@ mod tests {
             .with_keepalive(keepalive)
             .with_idle_timeout(Duration::from_secs(5 * 60))
             .unwrap()
+            .with_request_head_timeout(Duration::from_secs(10))
+            .unwrap()
+            .with_body_read_timeout(Duration::from_secs(30))
+            .unwrap()
+            .with_response_write_timeout(Duration::from_secs(30))
+            .unwrap()
     }
 
     #[test]
@@ -2288,6 +2461,12 @@ mod tests {
             config.keepalive().unwrap().retries()
         );
         assert_eq!(Some(Duration::from_secs(5 * 60)), config.idle_timeout());
+        assert_eq!(Some(Duration::from_secs(10)), config.request_head_timeout());
+        assert_eq!(Some(Duration::from_secs(30)), config.body_read_timeout());
+        assert_eq!(
+            Some(Duration::from_secs(30)),
+            config.response_write_timeout()
+        );
         assert_eq!(TcpTransportConfig::default(), TcpTransportConfig::default());
     }
 
@@ -2314,6 +2493,24 @@ mod tests {
         assert!(matches!(
             TcpTransportConfig::default().with_idle_timeout(Duration::ZERO),
             Err(TcpTransportConfigError::ZeroDuration { .. })
+        ));
+        assert!(matches!(
+            TcpTransportConfig::default().with_request_head_timeout(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration {
+                option: "fixed request header"
+            })
+        ));
+        assert!(matches!(
+            TcpTransportConfig::default().with_body_read_timeout(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration {
+                option: "request body read"
+            })
+        ));
+        assert!(matches!(
+            TcpTransportConfig::default().with_response_write_timeout(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration {
+                option: "response write"
+            })
         ));
     }
 
@@ -2416,6 +2613,236 @@ mod tests {
             Err(RequestAdmissionError::Frame(Error::ConnectionIdleTimeout { timeout }))
                 if timeout == Duration::from_secs(30)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_head_deadline_starts_after_the_validated_length_prefix() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService { calls });
+        let (mut client, server) = duplex(64);
+        let mut ctx = Context::with_state(TcpContext::default());
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_request_head_timeout(Duration::from_secs(10))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+
+        // Waiting for the four-byte prefix is governed only by the independent
+        // idle policy, so the fixed-head deadline is not running yet.
+        advance(Duration::from_secs(60)).await;
+        assert!(!connection.is_finished());
+
+        client.write_all(&8_i32.to_be_bytes()).await.unwrap();
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(9)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(Error::ProtocolIoTimeout {
+                phase: ProtocolIoPhase::FixedRequestHeader,
+                timeout,
+            }) if timeout == Duration::from_secs(10)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_runtime_bounds_request_body_reads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService { calls });
+        let (mut client, server) = duplex(64);
+        let mut ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(64)));
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_body_read_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+        client
+            .write_all(&[0, 0, 0, 64, 0, 3, 0, 1, 0, 0, 0, 41])
+            .await
+            .unwrap();
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(Error::ProtocolIoTimeout {
+                phase: ProtocolIoPhase::RequestBody,
+                timeout,
+            }) if timeout == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_runtime_bounds_the_complete_response_write_and_flush() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService {
+            calls: calls.clone(),
+        });
+        let (mut client, server) = duplex(16);
+        let mut request = vec![0u8; 68];
+        request[..4].copy_from_slice(&64_i32.to_be_bytes());
+        request[4..6].copy_from_slice(&3_i16.to_be_bytes());
+        request[6..8].copy_from_slice(&1_i16.to_be_bytes());
+        request[8..12].copy_from_slice(&73_i32.to_be_bytes());
+        let mut ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(64)));
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_response_write_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        let writer = tokio::spawn(async move {
+            client.write_all(&request).await.unwrap();
+            client
+        });
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let _client = writer.await.unwrap();
+
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(Error::ProtocolIoTimeout {
+                phase: ProtocolIoPhase::ResponseWrite,
+                timeout,
+            }) if timeout == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_body_deadline_excludes_policy_wait_and_releases_lease_once() {
+        let gate = Arc::new(Semaphore::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: gate.clone(),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(64);
+        let mut ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(64)));
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_body_read_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+        client
+            .write_all(&[0, 0, 0, 64, 0, 3, 0, 1, 0, 0, 0, 41])
+            .await
+            .unwrap();
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        _ = started_rx.recv().await.unwrap();
+
+        // Capacity waits are intentionally unbounded and do not spend a
+        // client-I/O budget before the request owns its reservation.
+        advance(Duration::from_secs(300)).await;
+        assert!(!connection.is_finished());
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+
+        gate.add_permits(1);
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(RequestAdmissionError::Timeout {
+                phase: ProtocolIoPhase::RequestBody,
+                timeout,
+            }) if timeout == Duration::from_secs(30)
+        ));
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_response_deadline_covers_write_and_flush_and_releases_lease_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(1)),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(16);
+        let mut request = vec![0u8; 68];
+        request[..4].copy_from_slice(&64_i32.to_be_bytes());
+        request[4..6].copy_from_slice(&3_i16.to_be_bytes());
+        request[6..8].copy_from_slice(&1_i16.to_be_bytes());
+        request[8..12].copy_from_slice(&73_i32.to_be_bytes());
+        let mut ctx = Context::with_state(TcpContext::default().maximum_frame_size(Some(64)));
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_response_write_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        let writer = tokio::spawn(async move {
+            client.write_all(&request).await.unwrap();
+            client
+        });
+        assert_eq!(73, observed_rx.recv().await.unwrap());
+        // Retain the peer without reading: dropping it would turn this into an
+        // immediate broken pipe instead of exercising the configured bound.
+        let _client = writer.await.unwrap();
+
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(RequestAdmissionError::Timeout {
+                phase: ProtocolIoPhase::ResponseWrite,
+                timeout,
+            }) if timeout == Duration::from_secs(30)
+        ));
+        assert_eq!(1, drops.load(Ordering::SeqCst));
     }
 
     #[test]
