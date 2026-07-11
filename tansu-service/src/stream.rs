@@ -164,6 +164,23 @@ pub trait AdmissionLease {
     fn adjust(&mut self, adjustment: Self::Adjustment) -> Result<(), Self::Error>;
 }
 
+/// An admission lease that can lend restricted proof of its reservation.
+///
+/// An admitted service may need to pass the resource reservation to a
+/// zero-copy sink while it borrows the request payload. Returning only the
+/// application-defined evidence keeps that lifetime proof tied to the
+/// envelope without exposing the lease itself for replacement or extraction.
+///
+/// This is a separate, additive trait so existing admission policies that do
+/// not need to expose evidence retain their current API and behavior.
+pub trait AdmissionEvidence: AdmissionLease {
+    /// The restricted proof lent by the lease.
+    type Evidence: ?Sized;
+
+    /// Borrow evidence that remains valid exactly while this lease is alive.
+    fn evidence(&self) -> &Self::Evidence;
+}
+
 impl<L, T> AdmittedFrame<L, T> {
     /// Return the fixed request head associated with this payload.
     pub fn head(&self) -> &RequestHead {
@@ -198,6 +215,38 @@ where
     /// Adjust the reservation owned by this frame without exposing the guard.
     pub fn adjust_lease(&mut self, adjustment: L::Adjustment) -> Result<(), L::Error> {
         self.lease.adjust(adjustment)
+    }
+}
+
+impl<L, T> AdmittedFrame<L, T>
+where
+    L: AdmissionEvidence,
+{
+    /// Borrow the restricted evidence owned by this frame's admission lease.
+    ///
+    /// The lease remains private so callers can prove that admitted resources
+    /// stay reserved without gaining a way to replace or detach the guard.
+    pub fn evidence(&self) -> &L::Evidence {
+        self.lease.evidence()
+    }
+
+    /// Borrow the payload and its admission evidence for one shared lifetime.
+    ///
+    /// Returning these disjoint borrows together supports zero-copy consumers
+    /// that require both frame bytes and proof that their resources remain
+    /// charged. Neither borrow can outlive the admitted envelope.
+    ///
+    /// ```compile_fail
+    /// # use tansu_service::{AdmissionEvidence, AdmittedFrame};
+    /// fn detach_evidence<'a, L, T>(frame: AdmittedFrame<L, T>) -> &'a L::Evidence
+    /// where
+    ///     L: AdmissionEvidence,
+    /// {
+    ///     frame.payload_and_evidence().1
+    /// }
+    /// ```
+    pub fn payload_and_evidence(&self) -> (&T, &L::Evidence) {
+        (&self.payload, self.lease.evidence())
     }
 }
 
@@ -1707,9 +1756,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroUsize};
     use std::{
         io,
+        num::{NonZeroU32, NonZeroUsize},
+        ptr,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1733,10 +1783,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo,
-        FixedConnectionPolicy, FrameLength, Reply, RequestAdmissionError, RequestHead,
-        SocketOptionTarget, TcpBytesLayer, TcpContext, TcpKeepaliveConfig, TcpListenerService,
-        TcpTransportConfig, TcpTransportConfigError, configure_admitted_socket,
+        AcceptIntent, AdmissionEvidence, AdmissionLease, AdmittedFrame, AdmittedReply,
+        ConnectionInfo, FixedConnectionPolicy, FrameLength, Reply, RequestAdmissionError,
+        RequestHead, SocketOptionTarget, TcpBytesLayer, TcpContext, TcpKeepaliveConfig,
+        TcpListenerService, TcpTransportConfig, TcpTransportConfigError, configure_admitted_socket,
     };
     use crate::{BytesFrameLayer, Error};
 
@@ -1765,6 +1815,16 @@ mod tests {
         reservation: usize,
     }
 
+    #[derive(Debug)]
+    struct ReservationEvidence {
+        identity: usize,
+    }
+
+    #[derive(Debug)]
+    struct EvidenceLease {
+        reservation: Arc<ReservationEvidence>,
+    }
+
     impl AdmissionLease for AdjustableLease {
         type Adjustment = usize;
         type Error = std::convert::Infallible;
@@ -1772,6 +1832,23 @@ mod tests {
         fn adjust(&mut self, adjustment: Self::Adjustment) -> Result<(), Self::Error> {
             self.reservation = adjustment;
             Ok(())
+        }
+    }
+
+    impl AdmissionLease for EvidenceLease {
+        type Adjustment = ();
+        type Error = std::convert::Infallible;
+
+        fn adjust(&mut self, _adjustment: Self::Adjustment) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl AdmissionEvidence for EvidenceLease {
+        type Evidence = ReservationEvidence;
+
+        fn evidence(&self) -> &Self::Evidence {
+            &self.reservation
         }
     }
 
@@ -2381,6 +2458,30 @@ mod tests {
         let reply = frame.map_payload(|_| ()).reply(Reply::NoResponse);
         assert_eq!(91, reply.lease.identity);
         assert_eq!(128, reply.lease.reservation);
+    }
+
+    #[test]
+    fn admitted_frame_lends_payload_and_exact_lease_evidence() {
+        let reservation = Arc::new(ReservationEvidence { identity: 91 });
+        let expected_evidence = Arc::as_ptr(&reservation);
+        let frame = AdmittedFrame {
+            head: RequestHead {
+                body_len: 8,
+                api_key: 3,
+                api_version: 1,
+                correlation_id: 42,
+            },
+            payload: bytes::Bytes::from_static(b"admitted"),
+            lease: EvidenceLease {
+                reservation: reservation.clone(),
+            },
+        };
+
+        let (payload, evidence) = frame.payload_and_evidence();
+        assert_eq!(b"admitted".as_slice(), payload.as_ref());
+        assert_eq!(91, evidence.identity);
+        assert_eq!(expected_evidence, ptr::from_ref(evidence));
+        assert_eq!(ptr::from_ref(frame.evidence()), ptr::from_ref(evidence));
     }
 
     #[tokio::test]
