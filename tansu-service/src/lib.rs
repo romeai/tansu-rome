@@ -272,21 +272,37 @@ pub use frame::{
 pub use stream::{
     AcceptIntent, AdmissionEvidence, AdmissionLease, AdmittedFrame, AdmittedReply,
     AdmittedTcpBytesLayer, AdmittedTcpBytesService, BytesLayer, BytesService, BytesTcpService,
-    CloneConnectionService, ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, Reply,
-    RequestAdmissionError, RequestHead, TcpBytesLayer, TcpBytesService, TcpContext,
-    TcpContextLayer, TcpContextService, TcpKeepaliveConfig, TcpListenerError, TcpListenerLayer,
-    TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
+    CloneConnectionService, ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy,
+    ProtocolIoPhase, Reply, RequestAdmissionError, RequestHead, TcpBytesLayer, TcpBytesService,
+    TcpContext, TcpContextLayer, TcpContextService, TcpKeepaliveConfig, TcpListenerError,
+    TcpListenerLayer, TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
 };
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Auth(#[from] tansu_auth::Error),
     DuplicateRoute(i16),
-    ConnectionIdleTimeout { timeout: Duration },
-    FrameLengthOverflow { declared: i32 },
-    FrameTooBig { declared: usize, maximum: usize },
-    FrameTooShort { declared: usize, minimum: usize },
-    InvalidFrameLength { declared: i32 },
+    ConnectionIdleTimeout {
+        timeout: Duration,
+    },
+    ProtocolIoTimeout {
+        phase: ProtocolIoPhase,
+        timeout: Duration,
+    },
+    FrameLengthOverflow {
+        declared: i32,
+    },
+    FrameTooBig {
+        declared: usize,
+        maximum: usize,
+    },
+    FrameTooShort {
+        declared: usize,
+        minimum: usize,
+    },
+    InvalidFrameLength {
+        declared: i32,
+    },
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
     Message(String),
