@@ -13,8 +13,16 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap, error, fmt::Debug, io, marker::PhantomData, mem::size_of,
-    net::SocketAddr, num::NonZeroUsize, sync::Arc, time::SystemTime,
+    collections::HashMap,
+    error,
+    fmt::Debug,
+    io,
+    marker::PhantomData,
+    mem::size_of,
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -24,6 +32,7 @@ use rama::{
     Context, Layer, Service,
     layer::limit::policy::{Policy, PolicyOutput, PolicyResult, UnlimitedPolicy},
 };
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
@@ -46,6 +55,10 @@ const REQUEST_HEAD_BYTES: usize = FRAME_LENGTH_PREFIX_BYTES + MINIMUM_REQUEST_BO
 
 /// Minimum Kafka response body: correlation ID.
 const MINIMUM_RESPONSE_BODY_BYTES: usize = size_of::<i32>();
+
+/// Largest socket buffer request which socket2 can pass to `setsockopt`
+/// without narrowing the value to a negative platform `c_int`.
+const MAXIMUM_SOCKET_BUFFER_BYTES: usize = i32::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameLength {
@@ -355,6 +368,357 @@ impl ConnectionInfo {
     }
 }
 
+/// Invalid bounded TCP transport configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TcpTransportConfigError {
+    /// A receive or send buffer was configured as zero bytes.
+    #[error("TCP {option} socket buffer must contain at least one byte")]
+    ZeroSocketBuffer {
+        /// Socket option being configured.
+        option: &'static str,
+    },
+    /// A receive or send buffer cannot be represented by the socket API.
+    #[error(
+        "TCP {option} socket buffer of {requested} bytes exceeds the platform option limit of {maximum} bytes"
+    )]
+    SocketBufferTooLarge {
+        /// Socket option being configured.
+        option: &'static str,
+        /// Caller-requested byte count.
+        requested: usize,
+        /// Greatest safely representable byte count.
+        maximum: usize,
+    },
+    /// A duration which must establish a finite positive bound was zero.
+    #[error("TCP {option} duration must be greater than zero")]
+    ZeroDuration {
+        /// Transport option being configured.
+        option: &'static str,
+    },
+    /// A keepalive probe count which must establish a finite positive bound was zero.
+    #[error("TCP keepalive retries must be greater than zero")]
+    ZeroKeepaliveRetries,
+}
+
+/// TCP keepalive policy for one accepted connection.
+///
+/// The idle period is required. Probe interval and retry count are optional so
+/// callers can retain platform defaults explicitly. If a configured option is
+/// unsupported by the target, socket setup fails instead of silently weakening
+/// the requested dead-peer bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpKeepaliveConfig {
+    idle: Duration,
+    interval: Option<Duration>,
+    retries: Option<NonZeroU32>,
+}
+
+impl TcpKeepaliveConfig {
+    /// Create a keepalive policy which starts probing after `idle`.
+    pub fn new(idle: Duration) -> Result<Self, TcpTransportConfigError> {
+        if idle.is_zero() {
+            return Err(TcpTransportConfigError::ZeroDuration {
+                option: "keepalive idle",
+            });
+        }
+
+        Ok(Self {
+            idle,
+            interval: None,
+            retries: None,
+        })
+    }
+
+    /// Set the positive interval between keepalive probes.
+    pub fn with_interval(mut self, interval: Duration) -> Result<Self, TcpTransportConfigError> {
+        if interval.is_zero() {
+            return Err(TcpTransportConfigError::ZeroDuration {
+                option: "keepalive interval",
+            });
+        }
+        self.interval = Some(interval);
+        Ok(self)
+    }
+
+    /// Set the positive number of unanswered probes allowed before disconnect.
+    pub fn with_retries(mut self, retries: u32) -> Result<Self, TcpTransportConfigError> {
+        self.retries =
+            Some(NonZeroU32::new(retries).ok_or(TcpTransportConfigError::ZeroKeepaliveRetries)?);
+        Ok(self)
+    }
+
+    /// Return the idle period before the first keepalive probe.
+    pub fn idle(&self) -> Duration {
+        self.idle
+    }
+
+    /// Return the configured probe interval, or `None` to retain the platform default.
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval
+    }
+
+    /// Return the configured probe count, or `None` to retain the platform default.
+    pub fn retries(&self) -> Option<NonZeroU32> {
+        self.retries
+    }
+}
+
+/// Bounded transport policy applied to each accepted TCP connection.
+///
+/// `Default` leaves every operating-system and connection lifetime default
+/// unchanged. Explicit values are installed after admission and acceptance but
+/// before constructing connection-local protocol services.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TcpTransportConfig {
+    receive_buffer_size: Option<NonZeroUsize>,
+    send_buffer_size: Option<NonZeroUsize>,
+    keepalive: Option<TcpKeepaliveConfig>,
+    idle_timeout: Option<Duration>,
+}
+
+impl TcpTransportConfig {
+    /// Request a positive kernel receive-buffer size.
+    ///
+    /// Operating systems may clamp or account for this request differently;
+    /// this value is the exact input supplied to the socket API.
+    pub fn with_receive_buffer_size(
+        mut self,
+        size: usize,
+    ) -> Result<Self, TcpTransportConfigError> {
+        self.receive_buffer_size = Some(checked_socket_buffer("receive", size)?);
+        Ok(self)
+    }
+
+    /// Request a positive kernel send-buffer size.
+    ///
+    /// Operating systems may clamp or account for this request differently;
+    /// this value is the exact input supplied to the socket API.
+    pub fn with_send_buffer_size(mut self, size: usize) -> Result<Self, TcpTransportConfigError> {
+        self.send_buffer_size = Some(checked_socket_buffer("send", size)?);
+        Ok(self)
+    }
+
+    /// Enable TCP keepalive using the supplied bounded probe policy.
+    pub fn with_keepalive(mut self, keepalive: TcpKeepaliveConfig) -> Self {
+        self.keepalive = Some(keepalive);
+        self
+    }
+
+    /// Close a connection which supplies no next frame prefix within `timeout`.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Result<Self, TcpTransportConfigError> {
+        if timeout.is_zero() {
+            return Err(TcpTransportConfigError::ZeroDuration {
+                option: "connection idle timeout",
+            });
+        }
+        self.idle_timeout = Some(timeout);
+        Ok(self)
+    }
+
+    /// Return the requested receive-buffer size.
+    pub fn receive_buffer_size(&self) -> Option<NonZeroUsize> {
+        self.receive_buffer_size
+    }
+
+    /// Return the requested send-buffer size.
+    pub fn send_buffer_size(&self) -> Option<NonZeroUsize> {
+        self.send_buffer_size
+    }
+
+    /// Return the configured keepalive policy.
+    pub fn keepalive(&self) -> Option<TcpKeepaliveConfig> {
+        self.keepalive
+    }
+
+    /// Return the idle period allowed while awaiting the next frame prefix.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+}
+
+fn checked_socket_buffer(
+    option: &'static str,
+    size: usize,
+) -> Result<NonZeroUsize, TcpTransportConfigError> {
+    let size =
+        NonZeroUsize::new(size).ok_or(TcpTransportConfigError::ZeroSocketBuffer { option })?;
+    if size.get() > MAXIMUM_SOCKET_BUFFER_BYTES {
+        return Err(TcpTransportConfigError::SocketBufferTooLarge {
+            option,
+            requested: size.get(),
+            maximum: MAXIMUM_SOCKET_BUFFER_BYTES,
+        });
+    }
+    Ok(size)
+}
+
+trait SocketOptionTarget {
+    fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()>;
+    fn set_send_buffer_size(&self, size: NonZeroUsize) -> io::Result<()>;
+    fn set_keepalive(&self, keepalive: TcpKeepaliveConfig) -> io::Result<()>;
+}
+
+impl SocketOptionTarget for TcpStream {
+    fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
+        SockRef::from(self).set_recv_buffer_size(size.get())
+    }
+
+    fn set_send_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
+        SockRef::from(self).set_send_buffer_size(size.get())
+    }
+
+    fn set_keepalive(&self, keepalive: TcpKeepaliveConfig) -> io::Result<()> {
+        let socket_keepalive = TcpKeepalive::new().with_time(keepalive.idle());
+        let socket_keepalive = apply_keepalive_interval(socket_keepalive, keepalive.interval())?;
+        let socket_keepalive = apply_keepalive_retries(socket_keepalive, keepalive.retries())?;
+        SockRef::from(self).set_tcp_keepalive(&socket_keepalive)
+    }
+}
+
+impl TcpTransportConfig {
+    fn apply<T>(&self, socket: &T) -> io::Result<()>
+    where
+        T: SocketOptionTarget,
+    {
+        if let Some(size) = self.receive_buffer_size {
+            socket.set_receive_buffer_size(size)?;
+        }
+        if let Some(size) = self.send_buffer_size {
+            socket.set_send_buffer_size(size)?;
+        }
+        if let Some(keepalive) = self.keepalive {
+            socket.set_keepalive(keepalive)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "windows",
+    target_os = "cygwin",
+    all(target_os = "wasi", not(target_env = "p1")),
+))]
+fn apply_keepalive_interval(
+    keepalive: TcpKeepalive,
+    interval: Option<Duration>,
+) -> io::Result<TcpKeepalive> {
+    Ok(match interval {
+        Some(interval) => keepalive.with_interval(interval),
+        None => keepalive,
+    })
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "windows",
+    target_os = "cygwin",
+    all(target_os = "wasi", not(target_env = "p1")),
+)))]
+fn apply_keepalive_interval(
+    keepalive: TcpKeepalive,
+    interval: Option<Duration>,
+) -> io::Result<TcpKeepalive> {
+    if interval.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP keepalive interval is not supported on this target",
+        ));
+    }
+    Ok(keepalive)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "cygwin",
+    target_os = "windows",
+    all(target_os = "wasi", not(target_env = "p1")),
+))]
+fn apply_keepalive_retries(
+    keepalive: TcpKeepalive,
+    retries: Option<NonZeroU32>,
+) -> io::Result<TcpKeepalive> {
+    Ok(match retries {
+        Some(retries) => keepalive.with_retries(retries.get()),
+        None => keepalive,
+    })
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "visionos",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "cygwin",
+    target_os = "windows",
+    all(target_os = "wasi", not(target_env = "p1")),
+)))]
+fn apply_keepalive_retries(
+    keepalive: TcpKeepalive,
+    retries: Option<NonZeroU32>,
+) -> io::Result<TcpKeepalive> {
+    if retries.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TCP keepalive retries are not supported on this target",
+        ));
+    }
+    Ok(keepalive)
+}
+
+fn configure_admitted_socket<T, Guard>(
+    config: TcpTransportConfig,
+    socket: &T,
+    guard: Guard,
+) -> io::Result<Guard>
+where
+    T: SocketOptionTarget,
+{
+    config.apply(socket)?;
+    Ok(guard)
+}
+
 /// A make-connection service that clones one connection service per socket.
 ///
 /// [`TcpListenerLayer`] uses this adapter to preserve its convenient layering
@@ -406,6 +770,10 @@ where
     /// The connection policy aborted an accept intent.
     #[error("connection policy aborted accept intent")]
     Policy(#[source] E),
+
+    /// Caller and listener attempted to install competing transport policies.
+    #[error("TCP transport configuration already exists in the connection context")]
+    TransportContextAlreadyConfigured,
 }
 
 /// A Rama limit policy with a fixed concurrent-connection limit.
@@ -466,6 +834,7 @@ where
 pub struct TcpListenerLayer<P = UnlimitedPolicy> {
     cancellation: CancellationToken,
     policy: P,
+    transport: TcpTransportConfig,
 }
 
 impl Default for TcpListenerLayer {
@@ -473,6 +842,7 @@ impl Default for TcpListenerLayer {
         Self {
             cancellation: CancellationToken::new(),
             policy: UnlimitedPolicy::new(),
+            transport: TcpTransportConfig::default(),
         }
     }
 }
@@ -482,6 +852,7 @@ impl TcpListenerLayer {
         Self {
             cancellation,
             policy: UnlimitedPolicy::new(),
+            transport: TcpTransportConfig::default(),
         }
     }
 }
@@ -492,7 +863,14 @@ impl<P> TcpListenerLayer<P> {
         TcpListenerLayer {
             cancellation: self.cancellation,
             policy,
+            transport: self.transport,
         }
+    }
+
+    /// Apply a bounded transport policy to every admitted socket.
+    pub fn with_transport_config(mut self, transport: TcpTransportConfig) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -508,6 +886,7 @@ where
             CloneConnectionService::new(inner),
         )
         .with_policy(self.policy.clone())
+        .with_transport_config(self.transport)
     }
 }
 
@@ -527,6 +906,7 @@ pub struct TcpListenerService<M, P = UnlimitedPolicy> {
     cancellation: CancellationToken,
     make_connection: M,
     policy: P,
+    transport: TcpTransportConfig,
 }
 
 impl<M> TcpListenerService<M> {
@@ -537,6 +917,7 @@ impl<M> TcpListenerService<M> {
             cancellation,
             make_connection,
             policy: UnlimitedPolicy::new(),
+            transport: TcpTransportConfig::default(),
         }
     }
 }
@@ -548,13 +929,22 @@ impl<M, P> TcpListenerService<M, P> {
             cancellation: self.cancellation,
             make_connection: self.make_connection,
             policy,
+            transport: self.transport,
         }
+    }
+
+    /// Apply a bounded transport policy to every admitted socket.
+    pub fn with_transport_config(mut self, transport: TcpTransportConfig) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
 impl<M, P> Debug for TcpListenerService<M, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(TcpListenerService)).finish()
+        f.debug_struct(stringify!(TcpListenerService))
+            .field("transport", &self.transport)
+            .finish()
     }
 }
 
@@ -635,7 +1025,7 @@ where
         let mut leases = HashMap::new();
 
         let result = 'listener: loop {
-            let Some((connection_ctx, lease)) =
+            let Some((mut connection_ctx, lease)) =
                 (match self.admit(ctx.clone(), &mut connections, &mut leases).await {
                     Ok(admission) => admission,
                     Err(error) => break 'listener Err(TcpListenerError::Policy(error)),
@@ -657,6 +1047,17 @@ where
                     () = self.cancellation.cancelled() => break 'listener Ok(()),
                 }
             };
+            if connection_ctx.get::<TcpTransportConfig>().is_some() {
+                break 'listener Err(TcpListenerError::TransportContextAlreadyConfigured);
+            }
+            let lease = match configure_admitted_socket(self.transport, &stream, lease) {
+                Ok(lease) => lease,
+                Err(error) => break 'listener Err(TcpListenerError::Io(error)),
+            };
+            assert!(
+                connection_ctx.insert(self.transport).is_none(),
+                "transport configuration absence was checked immediately before insertion"
+            );
             let connection = ConnectionInfo {
                 local_addr: match stream.local_addr() {
                     Ok(local_addr) => local_addr,
@@ -919,14 +1320,20 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         &self,
         stream: &mut R,
         maximum_frame_size: Option<usize>,
+        idle_timeout: Option<Duration>,
     ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), ReadHeadError>
     where
         R: AsyncReadExt + Unpin,
     {
         let mut encoded = [0u8; REQUEST_HEAD_BYTES];
-        _ = stream
-            .read_exact(&mut encoded[..FRAME_LENGTH_PREFIX_BYTES])
-            .await?;
+        let read = stream.read_exact(&mut encoded[..FRAME_LENGTH_PREFIX_BYTES]);
+        if let Some(timeout) = idle_timeout {
+            _ = tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| ReadHeadError::Frame(Error::ConnectionIdleTimeout { timeout }))??;
+        } else {
+            _ = read.await?;
+        }
 
         let length_prefix = encoded[..FRAME_LENGTH_PREFIX_BYTES]
             .try_into()
@@ -969,6 +1376,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         &self,
         stream: &mut R,
         maximum_frame_size: Option<usize>,
+        idle_timeout: Option<Duration>,
         ctx: Context<State>,
     ) -> Result<(), RequestAdmissionError<P::Error, S::Error>>
     where
@@ -980,7 +1388,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
         let (wire_head, length, encoded_head) = self
-            .read_head(stream, maximum_frame_size)
+            .read_head(stream, maximum_frame_size, idle_timeout)
             .await
             .map_err(|error| match error {
                 ReadHeadError::Io(error) => RequestAdmissionError::Io(error),
@@ -1049,10 +1457,13 @@ where
         mut stream: Stream,
     ) -> Result<Self::Response, Self::Error> {
         let maximum_frame_size = ctx.state().maximum_frame_size;
+        let idle_timeout = ctx
+            .get::<TcpTransportConfig>()
+            .and_then(TcpTransportConfig::idle_timeout);
         let (ctx, _) = ctx.swap_state(State::default());
 
         loop {
-            self.request(&mut stream, maximum_frame_size, ctx.clone())
+            self.request(&mut stream, maximum_frame_size, idle_timeout, ctx.clone())
                 .await?;
         }
     }
@@ -1069,16 +1480,22 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
+        idle_timeout: Option<Duration>,
     ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
         let mut head = [0u8; REQUEST_HEAD_BYTES];
 
-        _ = req
-            .read_exact(&mut head[..FRAME_LENGTH_PREFIX_BYTES])
-            .await
-            .inspect_err(|err| debug!(?err))?;
+        let read = req.read_exact(&mut head[..FRAME_LENGTH_PREFIX_BYTES]);
+        if let Some(timeout) = idle_timeout {
+            _ = tokio::time::timeout(timeout, read)
+                .await
+                .map_err(|_| Error::ConnectionIdleTimeout { timeout })?
+                .inspect_err(|err| debug!(?err))?;
+        } else {
+            _ = read.await.inspect_err(|err| debug!(?err))?;
+        }
 
         // Validate the declared body before reading even the fixed request
         // header. In particular, an oversized declaration never controls an
@@ -1164,13 +1581,15 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
+        idle_timeout: Option<Duration>,
         attributes: &[KeyValue],
         ctx: Context<TcpContext>,
     ) -> Result<(), S::Error>
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let (_head, length, encoded_head) = self.wait(req, maximum_frame_size).await?;
+        let (_head, length, encoded_head) =
+            self.wait(req, maximum_frame_size, idle_timeout).await?;
         let request = self.read(req, length, encoded_head).await?;
         let response = self.process(attributes, ctx, request).await?;
         self.write(req, response).await
@@ -1207,13 +1626,22 @@ where
         };
 
         let maximum_frame_size = ctx.state().maximum_frame_size;
+        let idle_timeout = ctx
+            .get::<TcpTransportConfig>()
+            .and_then(TcpTransportConfig::idle_timeout);
 
         loop {
             let ctx = ctx.clone();
             let attributes = attributes.clone();
 
-            self.req(&mut req, maximum_frame_size, &attributes[..], ctx)
-                .await?
+            self.req(
+                &mut req,
+                maximum_frame_size,
+                idle_timeout,
+                &attributes[..],
+                ctx,
+            )
+            .await?
         }
     }
 }
@@ -1262,11 +1690,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::{
         io,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -1283,14 +1711,15 @@ mod tests {
         io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
         net::{TcpListener, TcpStream},
         sync::{Semaphore, mpsc, oneshot},
-        time::{Duration, timeout},
+        time::{Duration, advance, timeout},
     };
     use tokio_util::sync::CancellationToken;
 
     use super::{
         AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo,
         FixedConnectionPolicy, FrameLength, Reply, RequestAdmissionError, RequestHead,
-        TcpBytesLayer, TcpContext, TcpListenerService,
+        SocketOptionTarget, TcpBytesLayer, TcpContext, TcpKeepaliveConfig, TcpListenerService,
+        TcpTransportConfig, TcpTransportConfigError, configure_admitted_socket,
     };
     use crate::{BytesFrameLayer, Error};
 
@@ -1622,6 +2051,229 @@ mod tests {
             _ = self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(req)
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SocketCall {
+        ReceiveBuffer(NonZeroUsize),
+        SendBuffer(NonZeroUsize),
+        Keepalive(TcpKeepaliveConfig),
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSocket {
+        calls: Mutex<Vec<SocketCall>>,
+        fail_on_call: Option<usize>,
+    }
+
+    impl RecordingSocket {
+        fn failing_on(call: usize) -> Self {
+            Self {
+                calls: Mutex::default(),
+                fail_on_call: Some(call),
+            }
+        }
+
+        fn record(&self, call: SocketCall) -> io::Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(call);
+            if self.fail_on_call == Some(calls.len()) {
+                Err(io::Error::other("injected socket option failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl SocketOptionTarget for RecordingSocket {
+        fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
+            self.record(SocketCall::ReceiveBuffer(size))
+        }
+
+        fn set_send_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
+            self.record(SocketCall::SendBuffer(size))
+        }
+
+        fn set_keepalive(&self, keepalive: TcpKeepaliveConfig) -> io::Result<()> {
+            self.record(SocketCall::Keepalive(keepalive))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            _ = self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn bounded_transport_config() -> TcpTransportConfig {
+        let keepalive = TcpKeepaliveConfig::new(Duration::from_secs(60))
+            .unwrap()
+            .with_interval(Duration::from_secs(30))
+            .unwrap()
+            .with_retries(3)
+            .unwrap();
+        TcpTransportConfig::default()
+            .with_receive_buffer_size(256 * 1024)
+            .unwrap()
+            .with_send_buffer_size(128 * 1024)
+            .unwrap()
+            .with_keepalive(keepalive)
+            .with_idle_timeout(Duration::from_secs(5 * 60))
+            .unwrap()
+    }
+
+    #[test]
+    fn bounded_transport_configuration_round_trips_without_hidden_defaults() {
+        let config = bounded_transport_config();
+
+        assert_eq!(
+            Some(NonZeroUsize::new(256 * 1024).unwrap()),
+            config.receive_buffer_size()
+        );
+        assert_eq!(
+            Some(NonZeroUsize::new(128 * 1024).unwrap()),
+            config.send_buffer_size()
+        );
+        assert_eq!(Duration::from_secs(60), config.keepalive().unwrap().idle());
+        assert_eq!(
+            Some(Duration::from_secs(30)),
+            config.keepalive().unwrap().interval()
+        );
+        assert_eq!(
+            Some(NonZeroU32::new(3).unwrap()),
+            config.keepalive().unwrap().retries()
+        );
+        assert_eq!(Some(Duration::from_secs(5 * 60)), config.idle_timeout());
+        assert_eq!(TcpTransportConfig::default(), TcpTransportConfig::default());
+    }
+
+    #[test]
+    fn bounded_transport_configuration_rejects_values_which_do_not_bound_resources() {
+        assert!(matches!(
+            TcpTransportConfig::default().with_receive_buffer_size(0),
+            Err(TcpTransportConfigError::ZeroSocketBuffer { option: "receive" })
+        ));
+        assert!(matches!(
+            TcpTransportConfig::default().with_send_buffer_size(i32::MAX as usize + 1),
+            Err(TcpTransportConfigError::SocketBufferTooLarge { option: "send", .. })
+        ));
+        assert!(matches!(
+            TcpKeepaliveConfig::new(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration { .. })
+        ));
+        assert!(matches!(
+            TcpKeepaliveConfig::new(Duration::from_secs(1))
+                .unwrap()
+                .with_retries(0),
+            Err(TcpTransportConfigError::ZeroKeepaliveRetries)
+        ));
+        assert!(matches!(
+            TcpTransportConfig::default().with_idle_timeout(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration { .. })
+        ));
+    }
+
+    #[test]
+    fn socket_options_are_applied_exactly_once_in_declared_order() {
+        let config = bounded_transport_config();
+        let socket = RecordingSocket::default();
+
+        config.apply(&socket).unwrap();
+
+        assert_eq!(
+            vec![
+                SocketCall::ReceiveBuffer(NonZeroUsize::new(256 * 1024).unwrap()),
+                SocketCall::SendBuffer(NonZeroUsize::new(128 * 1024).unwrap()),
+                SocketCall::Keepalive(config.keepalive().unwrap()),
+            ],
+            *socket.calls.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn socket_setup_failure_releases_admission_guard() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let socket = RecordingSocket::failing_on(2);
+
+        let result = configure_admitted_socket(
+            bounded_transport_config(),
+            &socket,
+            DropProbe(drops.clone()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+        assert_eq!(2, socket.calls.lock().unwrap().len());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_expires_only_while_waiting_for_the_next_frame_prefix() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService { calls });
+        let (_client, server) = duplex(64);
+        let mut ctx = Context::with_state(TcpContext::default());
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_idle_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(Error::ConnectionIdleTimeout { timeout }) if timeout == Duration::from_secs(30)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_runtime_expires_only_while_waiting_for_the_next_frame_prefix() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(1)),
+                started: started_tx,
+                drops,
+                abort: false,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (_client, server) = duplex(64);
+        let mut ctx = Context::with_state(TcpContext::default());
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_idle_timeout(Duration::from_secs(30))
+                    .unwrap(),
+            )
+            .is_none()
+        );
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(29)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(RequestAdmissionError::Frame(Error::ConnectionIdleTimeout { timeout }))
+                if timeout == Duration::from_secs(30)
+        ));
     }
 
     #[test]
@@ -2166,6 +2818,69 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn competing_transport_context_fails_before_factory_and_releases_guard() {
+        let cancellation = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_drops = Arc::new(AtomicUsize::new(0));
+        let (connection_tx, _connection_rx) = mpsc::unbounded_channel();
+        let (admission_tx, mut admission_rx) = mpsc::unbounded_channel();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let service = TcpListenerService::new(
+            cancellation,
+            MakeConnection {
+                calls: calls.clone(),
+                started: connection_tx,
+                drops: service_drops,
+            },
+        )
+        .with_policy(GatedPolicy {
+            gate: gate.clone(),
+            started: admission_tx,
+            ready: ready_tx,
+            dropped: dropped_tx,
+            drops: lease_drops.clone(),
+        });
+        let mut ctx = Context::default();
+        assert!(ctx.insert(TcpTransportConfig::default()).is_none());
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let _listener_task = tokio::spawn(async move {
+            let result = service.serve(ctx, listener).await;
+            finished_tx.send(result).unwrap();
+        });
+
+        let client = TcpStream::connect(local_addr).await.unwrap();
+        timeout(Duration::from_secs(1), admission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.add_permits(1);
+        timeout(Duration::from_secs(1), ready_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), finished_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(super::TcpListenerError::TransportContextAlreadyConfigured)
+        ));
+        timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+        assert_eq!(0, calls.load(Ordering::SeqCst));
+        drop(client);
     }
 
     #[tokio::test]
