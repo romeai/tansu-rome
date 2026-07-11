@@ -14,7 +14,7 @@
 
 use std::io::Cursor;
 
-use crate::{Authentication, Error, Stage};
+use crate::{AuthError, Authentication, Error, Stage};
 use bytes::Bytes;
 use rama::{Context, Service};
 use rsasl::prelude::State;
@@ -87,21 +87,32 @@ where
                                     .session_lifetime_ms(Some(0));
                             };
 
-                            let success = session
-                                .validation()
-                                .transpose()
-                                .ok()
-                                .flatten()
-                                .inspect(|success| debug!(?success));
+                            let auth_bytes = Bytes::from(outcome.into_inner());
 
                             if let State::Finished(_) = state {
-                                _ = guard.replace(Stage::Finished(success))
+                                let verdict = session
+                                    .validation()
+                                    .unwrap_or(Err(AuthError::MissingValidation));
+                                let authenticated = verdict.is_ok();
+
+                                debug!(?verdict, authenticated);
+                                _ = guard.replace(Stage::Finished(verdict));
+
+                                if !authenticated {
+                                    return SaslAuthenticateResponse::default()
+                                        .error_code(ErrorCode::SaslAuthenticationFailed.into())
+                                        .error_message(Some(
+                                            ErrorCode::SaslAuthenticationFailed.to_string(),
+                                        ))
+                                        .auth_bytes(auth_bytes)
+                                        .session_lifetime_ms(Some(0));
+                                }
                             }
 
                             SaslAuthenticateResponse::default()
                                 .error_code(ErrorCode::None.into())
                                 .error_message(Some("NONE".into()))
-                                .auth_bytes(Bytes::from(outcome.into_inner()))
+                                .auth_bytes(auth_bytes)
                                 .session_lifetime_ms(session_lifetime_ms)
                         } else {
                             _ = guard.take();

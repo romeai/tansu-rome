@@ -59,16 +59,127 @@ pub mod common;
 
 type Broker = BytesFrameService<FrameRouteService<(), Error>>;
 
-fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
+fn routes<S>(storage: S) -> Result<FrameRouteService<(), Error>>
 where
     S: Storage + Clone,
 {
     storage::services(FrameRouteService::<(), Error>::builder(), storage)
         .and_then(auth::services)
         .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+}
+
+fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
+where
+    S: Storage + Clone,
+{
+    routes(storage).map(|frame_route| {
+        (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
+    })
+}
+
+async fn authenticate(broker: &Broker, principal: &str, password: &str) -> Result<ErrorCode> {
+    const API_VERSION: i16 = 1;
+    const CLIENT_ID: &str = "auth-regression";
+
+    let ctx = Context::default();
+    let mut correlation_id = 0;
+    let response = broker
+        .serve(
+            ctx.clone(),
+            Frame::request(
+                Header::Request {
+                    api_key: SaslHandshakeRequest::KEY,
+                    api_version: API_VERSION,
+                    correlation_id,
+                    client_id: Some(CLIENT_ID.into()),
+                },
+                Body::SaslHandshakeRequest(
+                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-512".into()),
+                ),
+            )?,
+        )
+        .await?;
+    let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
+        .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+
+    let offered = response
+        .mechanisms
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
+        .collect::<Vec<_>>();
+    let sasl = SASLClient::new(
+        SASLConfig::with_credentials(None, principal.into(), password.into())
+            .expect("sasl credential config"),
+    );
+    let mut session = sasl
+        .start_suggested(&offered)
+        .expect("offered SCRAM mechanism");
+    let mut input = None;
+
+    loop {
+        correlation_id += 1;
+        let mut output = BytesMut::new().writer();
+
+        match session.step(input.as_deref(), &mut output) {
+            Ok(State::Running) => {
+                let response = broker
+                    .serve(
+                        ctx.clone(),
+                        Frame::request(
+                            Header::Request {
+                                api_key: SaslAuthenticateRequest::KEY,
+                                api_version: API_VERSION,
+                                correlation_id,
+                                client_id: Some(CLIENT_ID.into()),
+                            },
+                            Body::SaslAuthenticateRequest(
+                                SaslAuthenticateRequest::default()
+                                    .auth_bytes(Bytes::from(output.into_inner())),
+                            ),
+                        )?,
+                    )
+                    .await?;
+                let response = Frame::response_from_bytes(
+                    response,
+                    SaslAuthenticateResponse::KEY,
+                    API_VERSION,
+                )
+                .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
+                let error_code = ErrorCode::try_from(response.error_code)?;
+
+                if error_code != ErrorCode::None {
+                    return Ok(error_code);
+                }
+
+                input = Some(response.auth_bytes);
+            }
+            Ok(State::Finished(_)) => return Ok(ErrorCode::None),
+            Err(SessionError::MechanismError(_)) => {
+                panic!("client observed a mechanism error before the broker returned its verdict")
+            }
+            Err(error) => panic!("unexpected SASL client error: {error:?}"),
+        }
+    }
+}
+
+fn protected_request() -> Result<Bytes> {
+    Ok(Frame::request(
+        Header::Request {
+            api_key: CreateTopicsRequest::KEY,
+            api_version: 7,
+            correlation_id: 1,
+            client_id: Some("auth-regression".into()),
+        },
+        Body::CreateTopicsRequest(
+            CreateTopicsRequest::default()
+                .timeout_ms(30_000)
+                .validate_only(Some(false))
+                .topics(Some([].into())),
+        ),
+    )?)
 }
 
 #[tokio::test]
@@ -573,7 +684,11 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
                 )
                 .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
                 debug!(?response);
-                assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+                let error_code = ErrorCode::try_from(response.error_code)?;
+                if error_code == ErrorCode::SaslAuthenticationFailed {
+                    break;
+                }
+                assert_eq!(ErrorCode::None, error_code);
 
                 input = Some(response.auth_bytes);
             }
@@ -587,6 +702,67 @@ async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
 
             Err(_) => unimplemented!(),
         }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn authentication_requires_a_verified_principal_and_is_connection_local() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    const PRINCIPAL: &str = "alice";
+    const PASSWORD: &str = "secret";
+
+    let engine = Engine::default().with_credential(
+        PRINCIPAL,
+        ScramMechanism::Scram512,
+        ScramCredential {
+            salt: Bytes::from_static(&[
+                51, 107, 103, 48, 106, 108, 108, 119, 112, 101, 99, 53, 121, 118, 100, 50, 114, 99,
+                52, 120, 122, 102, 110, 97, 98,
+            ]),
+            iterations: 8192,
+            stored_key: Bytes::from_static(&[
+                196, 134, 61, 247, 249, 195, 172, 31, 25, 47, 16, 203, 108, 147, 118, 10, 196, 207,
+                147, 26, 36, 10, 101, 115, 52, 79, 87, 86, 200, 153, 131, 34, 102, 91, 132, 40, 85,
+                78, 240, 50, 240, 152, 39, 87, 20, 230, 28, 185, 102, 114, 87, 182, 51, 83, 110,
+                35, 77, 93, 186, 24, 204, 17, 121, 100,
+            ]),
+            server_key: Bytes::from_static(&[
+                232, 156, 219, 209, 141, 82, 172, 239, 164, 247, 237, 158, 68, 216, 177, 230, 69,
+                25, 238, 6, 99, 212, 9, 238, 103, 116, 42, 34, 119, 91, 207, 81, 77, 81, 235, 48,
+                218, 126, 38, 209, 153, 135, 164, 8, 230, 100, 94, 19, 105, 222, 2, 57, 38, 42, 48,
+                210, 161, 61, 146, 10, 7, 92, 100, 192,
+            ]),
+        },
+    );
+    let sasl_config = tansu_auth::configuration(engine.clone()).map_err(Error::from)?;
+    let frame_route = routes(engine)?;
+    let layer = BytesFrameLayer::default().with_sasl_config(Some(sasl_config));
+    let verified = layer.clone().layer(frame_route.clone());
+    let wrong_password = layer.clone().layer(frame_route.clone());
+    let unknown_user = layer.clone().layer(frame_route.clone());
+    let untouched_connection = layer.layer(frame_route);
+
+    assert_eq!(
+        ErrorCode::None,
+        authenticate(&verified, PRINCIPAL, PASSWORD).await?
+    );
+    assert_eq!(
+        ErrorCode::SaslAuthenticationFailed,
+        authenticate(&wrong_password, PRINCIPAL, "wrong-password").await?
+    );
+    assert_eq!(
+        ErrorCode::SaslAuthenticationFailed,
+        authenticate(&unknown_user, "unknown-user", PASSWORD).await?
+    );
+
+    for broker in [&wrong_password, &unknown_user, &untouched_connection] {
+        assert!(matches!(
+            broker.serve(Context::default(), protected_request()?).await,
+            Err(Error::KafkaProtocol(tansu_sans_io::Error::NotAuthenticated)),
+        ));
     }
 
     Ok(())
