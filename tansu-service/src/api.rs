@@ -215,16 +215,170 @@ where
         let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
         supported.push(api_key);
 
-        self.with_route(
-            api_key,
+        self.build_with_api_versions_service(ApiVersionsService {
+            supported,
+            error: PhantomData,
+        })
+    }
+
+    /// Build the route table with an explicitly supplied API versions service.
+    ///
+    /// Unlike [`Self::build`], the response produced by `service` is independent
+    /// of the other registered routes. This permits a broker to keep a route
+    /// callable without advertising it to clients.
+    pub fn build_with_api_versions_service<S>(
+        self,
+        service: S,
+    ) -> Result<FrameRouteService<State, E>, Error>
+    where
+        S: Service<State, Frame, Response = Frame, Error = E> + Send + Sync + 'static,
+    {
+        self.with_route(ApiVersionsRequest::KEY, service.boxed())
+            .map(|builder| FrameRouteService {
+                routes: Arc::new(builder.routes),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rama::{Context, Layer as _, Service as _};
+    use tansu_sans_io::{
+        ApiKey as _, ApiVersionsRequest, Body, ErrorCode, Frame, Header, MetadataRequest,
+        MetadataResponse,
+    };
+
+    use super::{ApiVersionsService, FrameRouteService};
+    use crate::{Error, RequestLayer, ResponseService};
+
+    fn api_versions_request() -> Frame {
+        Frame {
+            size: 0,
+            header: Header::Request {
+                api_key: ApiVersionsRequest::KEY,
+                api_version: 4,
+                correlation_id: 23,
+                client_id: Some("test".into()),
+            },
+            body: Body::ApiVersionsRequest(
+                ApiVersionsRequest::default()
+                    .client_software_name(Some("test".into()))
+                    .client_software_version(Some("1".into())),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_build_matches_equivalent_explicit_service() -> Result<(), Error> {
+        let default = FrameRouteService::<(), Error>::builder().build()?;
+        let explicit = FrameRouteService::<(), Error>::builder().build_with_api_versions_service(
             ApiVersionsService {
-                supported,
-                error: PhantomData,
+                supported: vec![ApiVersionsRequest::KEY],
+                error: std::marker::PhantomData,
+            },
+        )?;
+
+        let request = api_versions_request();
+        let default_response = default.serve(Context::default(), request.clone()).await?;
+        let explicit_response = explicit.serve(Context::default(), request).await?;
+
+        let default_bytes = Frame::response(
+            default_response.header,
+            default_response.body,
+            ApiVersionsRequest::KEY,
+            4,
+        )?;
+        let explicit_bytes = Frame::response(
+            explicit_response.header,
+            explicit_response.body,
+            ApiVersionsRequest::KEY,
+            4,
+        )?;
+
+        assert_eq!(default_bytes, explicit_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_api_versions_can_hide_a_callable_route() -> Result<(), Error> {
+        let metadata =
+            RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
+                Ok::<_, Error>(
+                    MetadataResponse::default()
+                        .brokers(Some([].into()))
+                        .topics(Some([].into()))
+                        .cluster_id(Some("denial-route".into()))
+                        .controller_id(Some(111))
+                        .throttle_time_ms(Some(0))
+                        .cluster_authorized_operations(Some(-1)),
+                )
+            }));
+
+        let route = FrameRouteService::<(), Error>::builder()
+            .with_service(metadata)?
+            .build_with_api_versions_service(ApiVersionsService {
+                supported: vec![ApiVersionsRequest::KEY],
+                error: std::marker::PhantomData,
+            })?;
+
+        let versions = route
+            .serve(Context::default(), api_versions_request())
+            .await?
+            .body;
+        let versions = tansu_sans_io::ApiVersionsResponse::try_from(versions)?;
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(versions.error_code)?);
+        assert_eq!(
+            vec![ApiVersionsRequest::KEY],
+            versions
+                .api_keys
+                .unwrap_or_default()
+                .into_iter()
+                .map(|version| version.api_key)
+                .collect::<Vec<_>>(),
+        );
+
+        let metadata_response = route
+            .serve(
+                Context::default(),
+                Frame {
+                    size: 0,
+                    header: Header::Request {
+                        api_key: MetadataRequest::KEY,
+                        api_version: 12,
+                        correlation_id: 29,
+                        client_id: Some("test".into()),
+                    },
+                    body: Body::MetadataRequest(MetadataRequest::default()),
+                },
+            )
+            .await?;
+        assert_eq!(
+            Some("denial-route".into()),
+            MetadataResponse::try_from(metadata_response.body)?.cluster_id,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_api_versions_preserves_duplicate_route_error() -> Result<(), Error> {
+        let builder = FrameRouteService::<(), Error>::builder().with_route(
+            ApiVersionsRequest::KEY,
+            ApiVersionsService {
+                supported: vec![ApiVersionsRequest::KEY],
+                error: std::marker::PhantomData,
             }
             .boxed(),
-        )
-        .map(|builder| FrameRouteService {
-            routes: Arc::new(builder.routes),
-        })
+        )?;
+
+        assert!(matches!(
+            builder.build_with_api_versions_service(ApiVersionsService {
+                supported: vec![ApiVersionsRequest::KEY],
+                error: std::marker::PhantomData,
+            }),
+            Err(Error::DuplicateRoute(key)) if key == ApiVersionsRequest::KEY
+        ));
+
+        Ok(())
     }
 }
