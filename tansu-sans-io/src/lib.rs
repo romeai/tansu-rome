@@ -417,7 +417,12 @@ pub enum Error {
         limit: usize,
         actual: usize,
     },
+    FrameSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     InvalidDecodeLimits(&'static str),
+    InvalidFrameSize(i32),
     Message(String),
     MessageMaxSizeExceeded(usize),
     NoSuchField(&'static str),
@@ -437,6 +442,7 @@ pub enum Error {
     TryFromInt(#[from] num::TryFromIntError),
     TryFromSlice(#[from] TryFromSliceError),
     TryGet(Arc<TryGetError>),
+    TrailingFrameBytes(usize),
     UnexpectedType(String),
     UnknownApiErrorCode(i16),
     UnknownAssignor(String),
@@ -674,12 +680,12 @@ impl Frame {
 
     /// Deserialize an API request from a caller-supplied complete frame under resource limits.
     ///
-    /// The complete input and every peer-declared value are checked before the decoder allocates
-    /// or traverses that value. This entry point retains the compatibility behavior of
-    /// [`Self::request_from_bytes`]: framing validity is handled separately from resource limits.
+    /// The input must contain exactly one frame: its prefix must equal the number of following
+    /// bytes, and decoding must consume all of them. The complete frame and every peer-declared
+    /// value are checked before the decoder allocates or traverses that value.
     #[instrument(skip_all)]
     pub fn request_from_bytes_with_limits(
-        encoded: impl Buf,
+        mut encoded: impl Buf,
         limits: DecodeLimits,
     ) -> Result<Frame> {
         let start = SystemTime::now();
@@ -694,10 +700,32 @@ impl Frame {
             });
         }
 
-        let mut reader = encoded.reader();
+        let declared_payload_bytes = encoded.try_get_i32()?;
+        let declared_payload_bytes = usize::try_from(declared_payload_bytes)
+            .map_err(|_| Error::InvalidFrameSize(declared_payload_bytes))?;
+        let expected_frame_bytes = declared_payload_bytes
+            .checked_add(size_of::<i32>())
+            .ok_or(Error::Overflow)?;
+        if expected_frame_bytes != frame_bytes {
+            return Err(Error::FrameSizeMismatch {
+                expected: expected_frame_bytes,
+                actual: frame_bytes,
+            });
+        }
+
+        let prefix = i32::try_from(declared_payload_bytes)?.to_be_bytes();
+        let mut reader = Buf::chain(&prefix[..], encoded).reader();
         let mut deserializer = Decoder::request_with_limits(&mut reader, limits)?;
-        Frame::deserialize(&mut deserializer)
-            .inspect(|frame| debug!(?frame, elapsed_millis = Self::elapsed_millis(start)))
+        let frame = Frame::deserialize(&mut deserializer)?;
+        drop(deserializer);
+
+        let remaining = reader.get_ref().remaining();
+        if remaining > 0 {
+            return Err(Error::TrailingFrameBytes(remaining));
+        }
+
+        debug!(?frame, elapsed_millis = Self::elapsed_millis(start));
+        Ok(frame)
     }
 
     /// serialize an API response into a frame of bytes
