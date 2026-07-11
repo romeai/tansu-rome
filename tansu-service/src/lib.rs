@@ -270,8 +270,9 @@ pub use frame::{
 };
 
 pub use stream::{
-    BytesLayer, BytesService, BytesTcpService, TcpBytesLayer, TcpBytesService, TcpContext,
-    TcpContextLayer, TcpContextService, TcpListenerLayer,
+    BytesLayer, BytesService, BytesTcpService, CloneConnectionService, ConnectionInfo,
+    TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
+    TcpListenerLayer, TcpListenerService,
 };
 
 #[derive(Clone, Debug, thiserror::Error)]
