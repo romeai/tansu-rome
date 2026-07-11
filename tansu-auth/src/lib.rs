@@ -13,32 +13,44 @@
 // limitations under the License.
 
 use rsasl::{
-    callback::{Context, Request, SessionCallback, SessionData},
+    callback::SessionCallback,
     config::SASLConfig,
-    mechanisms::scram::{SCRAM_SHA256, SCRAM_SHA512, properties::ScramStoredPassword},
+    mechanisms::scram::{SCRAM_SHA256, SCRAM_SHA512},
     prelude::{Mechanism, Registry, SASLError, SASLServer, Session, SessionError, Validation},
+};
+#[cfg(any(feature = "storage", test))]
+use rsasl::{
+    callback::{Context, SessionData},
     property::{AuthId, AuthzId},
-    validate::{Validate, ValidationError},
 };
 use std::{
     fmt::{self, Debug, Formatter},
-    str::FromStr,
     sync::{Arc, Mutex, PoisonError},
 };
 use tansu_sans_io::ScramMechanism;
-use tansu_storage::Storage;
 use thiserror::Error;
 use tokio::task::JoinError;
+#[cfg(any(feature = "storage", test))]
 use tracing::{debug, instrument};
 
 mod authenticate;
 mod handshake;
+#[cfg(feature = "storage")]
+mod storage;
 
 pub use authenticate::SaslAuthenticateService;
 pub use handshake::SaslHandshakeService;
+#[cfg(feature = "storage")]
+pub use storage::{Callback, configuration};
 
 /// SASL mechanisms whose credentials Tansu verifies before granting an identity.
 static VERIFIED_MECHANISMS: &[Mechanism] = &[SCRAM_SHA512, SCRAM_SHA256];
+
+/// The verified rsasl registry for callers that intentionally offer only SCRAM-SHA-256.
+static SCRAM_SHA256_MECHANISM: &[Mechanism] = &[SCRAM_SHA256];
+
+/// The verified rsasl registry for callers that intentionally offer only SCRAM-SHA-512.
+static SCRAM_SHA512_MECHANISM: &[Mechanism] = &[SCRAM_SHA512];
 
 fn is_verified_mechanism(mechanism: &str) -> bool {
     VERIFIED_MECHANISMS
@@ -158,6 +170,20 @@ pub struct Success {
     auth_id: String,
 }
 
+impl Success {
+    /// Records the authenticated identity returned by a caller-supplied rsasl callback.
+    pub fn new(auth_id: impl Into<String>) -> Self {
+        Self {
+            auth_id: auth_id.into(),
+        }
+    }
+
+    /// Returns the identity authenticated by the SASL exchange.
+    pub fn auth_id(&self) -> &str {
+        &self.auth_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Justification;
 
@@ -165,23 +191,41 @@ impl Validation for Justification {
     type Value = Result<Success, AuthError>;
 }
 
-#[derive(Clone, Debug)]
-pub struct Callback<S> {
-    storage: S,
-}
-
-impl<S> Callback<S>
+/// Builds a SCRAM-only SASL configuration from a caller-supplied rsasl callback.
+///
+/// The callback supplies credentials and records a [`Success`] verdict. Protocol
+/// handling remains in this crate, while callers can source credentials without
+/// depending on Tansu's storage crate.
+pub fn configuration_with_callback<C>(callback: C) -> Result<Arc<SASLConfig>, Error>
 where
-    S: Storage,
+    C: SessionCallback + 'static,
 {
-    pub fn new(storage: S) -> Self
-    where
-        S: Storage,
-    {
-        Self { storage }
-    }
+    SASLConfig::builder()
+        .with_registry(Registry::with_mechanisms(VERIFIED_MECHANISMS))
+        .with_callback(callback)
+        .map_err(Into::into)
 }
 
+/// Builds a SASL configuration offering exactly one verified SCRAM mechanism.
+pub fn configuration_with_callback_for<C>(
+    callback: C,
+    mechanism: ScramMechanism,
+) -> Result<Arc<SASLConfig>, Error>
+where
+    C: SessionCallback + 'static,
+{
+    let mechanisms = match mechanism {
+        ScramMechanism::Scram256 => SCRAM_SHA256_MECHANISM,
+        ScramMechanism::Scram512 => SCRAM_SHA512_MECHANISM,
+    };
+
+    SASLConfig::builder()
+        .with_registry(Registry::with_mechanisms(mechanisms))
+        .with_callback(callback)
+        .map_err(Into::into)
+}
+
+#[cfg(any(feature = "storage", test))]
 #[instrument(skip_all)]
 fn check_identity(
     session_data: &SessionData,
@@ -225,92 +269,21 @@ fn check_identity(
     }
 }
 
-impl<S> SessionCallback for Callback<S>
-where
-    S: Storage,
-{
-    #[instrument(skip_all)]
-    fn callback(
-        &self,
-        session_data: &SessionData,
-        context: &Context<'_>,
-        request: &mut Request<'_>,
-    ) -> Result<(), SessionError> {
-        debug!(?session_data);
-
-        if session_data.mechanism().mechanism.starts_with("SCRAM-") {
-            let mechanism = ScramMechanism::from_str(session_data.mechanism().mechanism)
-                .map_err(|error| SessionError::Boxed(Box::new(error)))?;
-
-            let auth_id = context
-                .get_ref::<AuthId>()
-                .ok_or(SessionError::ValidationError(
-                    ValidationError::MissingRequiredProperty,
-                ))?;
-
-            debug!(?auth_id, ?mechanism);
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-
-            if let Ok(Some(credential)) = rt
-                .block_on(
-                    async move { self.storage.user_scram_credential(auth_id, mechanism).await },
-                )
-                .inspect_err(|err| debug!(auth_id, ?mechanism, ?err))
-            {
-                _ = request
-                    .satisfy::<ScramStoredPassword<'_>>(&ScramStoredPassword::new(
-                        credential.iterations as u32,
-                        &credential.salt[..],
-                        &credential.stored_key[..],
-                        &credential.server_key[..],
-                    ))
-                    .inspect_err(|err| debug!(auth_id, ?mechanism, ?err))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    #[instrument(skip_all)]
-    fn validate(
-        &self,
-        session_data: &SessionData,
-        context: &Context<'_>,
-        validate: &mut Validate<'_>,
-    ) -> Result<(), ValidationError> {
-        debug!(?session_data);
-
-        _ = validate.with::<Justification, _>(|| {
-            check_identity(session_data, context).map_err(|e| ValidationError::Boxed(Box::new(e)))
-        })?;
-
-        Ok(())
-    }
-}
-
-pub fn configuration<S>(storage: S) -> Result<Arc<SASLConfig>, Error>
-where
-    S: Storage,
-{
-    SASLConfig::builder()
-        .with_registry(Registry::with_mechanisms(VERIFIED_MECHANISMS))
-        .with_callback(Callback::new(storage))
-        .map_err(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
     use rama::{Context as RamaContext, Service as _};
     use rsasl::{
+        callback::{Request, SessionCallback},
         mechanisms::plain::PLAIN,
-        prelude::{Mechanism, Registry},
+        mechanisms::scram::properties::ScramStoredPassword,
+        prelude::{Mechanism, Mechname, Registry, SASLClient, State},
+        property::AuthId,
+        validate::{Validate, ValidationError},
     };
-    use tansu_sans_io::{ErrorCode, SaslAuthenticateRequest};
+    use std::io::Cursor;
+    use tansu_sans_io::{ErrorCode, SaslAuthenticateRequest, SaslHandshakeRequest, ScramMechanism};
 
     /// Test registry simulating a downstream feature-unified PLAIN configuration.
     static PLAIN_MECHANISMS: &[Mechanism] = &[PLAIN];
@@ -334,6 +307,58 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct StaticScramCallback;
+
+    impl SessionCallback for StaticScramCallback {
+        fn callback(
+            &self,
+            _session_data: &SessionData,
+            context: &Context<'_>,
+            request: &mut Request<'_>,
+        ) -> Result<(), SessionError> {
+            /// Salt for the test-only `alice` / `secret` SCRAM-SHA-256 credential.
+            const SALT: &[u8] = b"k52tay1vvtia5e6lc37gn3f3h";
+            /// Stored key for the test-only `alice` / `secret` SCRAM-SHA-256 credential.
+            const STORED_KEY: &[u8] = &[
+                150, 254, 7, 121, 81, 205, 192, 207, 60, 206, 251, 24, 31, 131, 31, 15, 96, 75, 20,
+                228, 251, 132, 22, 235, 160, 72, 200, 130, 127, 49, 29, 150,
+            ];
+            /// Server key for the test-only `alice` / `secret` SCRAM-SHA-256 credential.
+            const SERVER_KEY: &[u8] = &[
+                186, 175, 253, 227, 176, 106, 88, 53, 186, 173, 104, 88, 94, 40, 115, 166, 44, 183,
+                199, 177, 137, 41, 225, 132, 56, 32, 70, 255, 223, 209, 22, 146,
+            ];
+            /// PBKDF2 iteration count used to generate the test-only SCRAM credential.
+            const ITERATIONS: u32 = 8192;
+
+            if context.get_ref::<AuthId>() == Some("alice") {
+                _ = request.satisfy::<ScramStoredPassword<'_>>(&ScramStoredPassword::new(
+                    ITERATIONS, SALT, STORED_KEY, SERVER_KEY,
+                ))?;
+            }
+
+            Ok(())
+        }
+
+        fn validate(
+            &self,
+            _session_data: &SessionData,
+            context: &Context<'_>,
+            validate: &mut Validate<'_>,
+        ) -> Result<(), ValidationError> {
+            _ = validate.with::<Justification, _>(|| {
+                Ok(context
+                    .get_ref::<AuthId>()
+                    .filter(|auth_id| *auth_id == "alice")
+                    .map(Success::new)
+                    .ok_or(AuthError::NoSuchUser))
+            })?;
+
+            Ok(())
+        }
+    }
+
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
 
@@ -341,6 +366,61 @@ mod tests {
     fn authentication() {
         is_send::<Authentication>();
         is_sync::<Authentication>();
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_scram_configuration_authenticates_without_storage() {
+        let config = configuration_with_callback_for(StaticScramCallback, ScramMechanism::Scram256)
+            .expect("static SCRAM configuration");
+        let authentication = Authentication::server(config);
+        let mut context = RamaContext::default();
+        assert!(context.insert(authentication.clone()).is_none());
+
+        let handshake = SaslHandshakeService
+            .serve(
+                context.clone(),
+                SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
+            )
+            .await
+            .expect("SASL handshake response");
+        assert_eq!(Some(vec!["SCRAM-SHA-256".into()]), handshake.mechanisms);
+
+        let client = SASLClient::new(
+            SASLConfig::with_credentials(None, "alice".into(), "secret".into())
+                .expect("client credentials"),
+        );
+        let offered = [Mechname::parse(b"SCRAM-SHA-256").expect("static SCRAM mechanism name")];
+        let mut session = client
+            .start_suggested(&offered)
+            .expect("SCRAM client session");
+        let mut input = None;
+
+        loop {
+            let mut output = Cursor::new(Vec::new());
+            let state = session
+                .step(input.as_deref(), &mut output)
+                .expect("SCRAM client step");
+            match state {
+                State::Running => {
+                    let response = SaslAuthenticateService::default()
+                        .serve(
+                            context.clone(),
+                            SaslAuthenticateRequest::default()
+                                .auth_bytes(Bytes::from(output.into_inner())),
+                        )
+                        .await
+                        .expect("SASL authenticate response");
+                    assert_eq!(
+                        ErrorCode::None,
+                        ErrorCode::try_from(response.error_code).expect("known Kafka error code"),
+                    );
+                    input = Some(response.auth_bytes);
+                }
+                State::Finished(_) => break,
+            }
+        }
+
+        assert!(authentication.is_authenticated());
     }
 
     #[tokio::test]

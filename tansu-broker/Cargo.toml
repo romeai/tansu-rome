@@ -49,7 +49,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slatedb = { workspace = true, optional = true }
-tansu-auth.workspace = true
+tansu-auth = { workspace = true, features = ["storage"] }
 tansu-model.workspace = true
 tansu-sans-io.workspace = true
 tansu-schema.workspace = true

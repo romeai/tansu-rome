@@ -10,12 +10,15 @@ license.workspace = true
 repository.workspace = true
 version.workspace = true
 
+[features]
+storage = ["dep:tansu-storage"]
+
 [dependencies]
 bytes.workspace = true
 rama.workspace = true
 rsasl.workspace = true
 tansu-sans-io.workspace = true
-tansu-storage.workspace = true
+tansu-storage = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
