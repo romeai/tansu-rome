@@ -470,6 +470,7 @@ impl TcpKeepaliveConfig {
 /// before constructing connection-local protocol services.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TcpTransportConfig {
+    nodelay: Option<bool>,
     receive_buffer_size: Option<NonZeroUsize>,
     send_buffer_size: Option<NonZeroUsize>,
     keepalive: Option<TcpKeepaliveConfig>,
@@ -477,6 +478,18 @@ pub struct TcpTransportConfig {
 }
 
 impl TcpTransportConfig {
+    /// Enable or disable Nagle's algorithm for accepted connections.
+    ///
+    /// Kafka interleaves large Produce frames with small latency-sensitive
+    /// control and authentication exchanges. `true` requests `TCP_NODELAY` so
+    /// those short responses are not held for packet coalescing or a delayed
+    /// acknowledgement. This is a latency policy, not a memory bound;
+    /// `Default` leaves the operating-system setting unchanged.
+    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
+        self.nodelay = Some(nodelay);
+        self
+    }
+
     /// Request a positive kernel receive-buffer size.
     ///
     /// Operating systems may clamp or account for this request differently;
@@ -513,6 +526,11 @@ impl TcpTransportConfig {
         }
         self.idle_timeout = Some(timeout);
         Ok(self)
+    }
+
+    /// Return the requested `TCP_NODELAY` setting.
+    pub fn nodelay(&self) -> Option<bool> {
+        self.nodelay
     }
 
     /// Return the requested receive-buffer size.
@@ -553,12 +571,17 @@ fn checked_socket_buffer(
 }
 
 trait SocketOptionTarget {
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()>;
     fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()>;
     fn set_send_buffer_size(&self, size: NonZeroUsize) -> io::Result<()>;
     fn set_keepalive(&self, keepalive: TcpKeepaliveConfig) -> io::Result<()>;
 }
 
 impl SocketOptionTarget for TcpStream {
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        TcpStream::set_nodelay(self, nodelay)
+    }
+
     fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
         SockRef::from(self).set_recv_buffer_size(size.get())
     }
@@ -580,6 +603,9 @@ impl TcpTransportConfig {
     where
         T: SocketOptionTarget,
     {
+        if let Some(nodelay) = self.nodelay {
+            socket.set_nodelay(nodelay)?;
+        }
         if let Some(size) = self.receive_buffer_size {
             socket.set_receive_buffer_size(size)?;
         }
@@ -2055,6 +2081,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum SocketCall {
+        NoDelay(bool),
         ReceiveBuffer(NonZeroUsize),
         SendBuffer(NonZeroUsize),
         Keepalive(TcpKeepaliveConfig),
@@ -2086,6 +2113,10 @@ mod tests {
     }
 
     impl SocketOptionTarget for RecordingSocket {
+        fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+            self.record(SocketCall::NoDelay(nodelay))
+        }
+
         fn set_receive_buffer_size(&self, size: NonZeroUsize) -> io::Result<()> {
             self.record(SocketCall::ReceiveBuffer(size))
         }
@@ -2116,6 +2147,7 @@ mod tests {
             .with_retries(3)
             .unwrap();
         TcpTransportConfig::default()
+            .with_nodelay(true)
             .with_receive_buffer_size(256 * 1024)
             .unwrap()
             .with_send_buffer_size(128 * 1024)
@@ -2129,6 +2161,7 @@ mod tests {
     fn bounded_transport_configuration_round_trips_without_hidden_defaults() {
         let config = bounded_transport_config();
 
+        assert_eq!(Some(true), config.nodelay());
         assert_eq!(
             Some(NonZeroUsize::new(256 * 1024).unwrap()),
             config.receive_buffer_size()
@@ -2185,6 +2218,7 @@ mod tests {
 
         assert_eq!(
             vec![
+                SocketCall::NoDelay(true),
                 SocketCall::ReceiveBuffer(NonZeroUsize::new(256 * 1024).unwrap()),
                 SocketCall::SendBuffer(NonZeroUsize::new(128 * 1024).unwrap()),
                 SocketCall::Keepalive(config.keepalive().unwrap()),
