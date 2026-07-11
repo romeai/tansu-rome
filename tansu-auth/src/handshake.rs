@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Authentication, Error, Stage, is_verified_mechanism};
+use crate::{Authentication, Error, SaslSession, Stage, is_verified_mechanism};
 use rama::{Context, Service};
 use rsasl::prelude::Mechname;
 use tansu_sans_io::{ApiKey, ErrorCode, SaslHandshakeRequest, SaslHandshakeResponse};
@@ -87,7 +87,7 @@ where
                     {
                         Ok(session) => {
                             let selected_mechanism = session.get_mechname().to_string();
-                            _ = guard.replace(Stage::Session(session));
+                            _ = guard.replace(Stage::Session(SaslSession::new(session)));
 
                             SaslHandshakeResponse::default()
                                 .error_code(ErrorCode::None.into())
