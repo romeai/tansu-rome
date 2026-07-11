@@ -15,10 +15,10 @@
 pub mod group;
 
 use crate::{
-    CancelKind, Error, Result,
+    CancelKind, DEFAULT_MAXIMUM_FRAME_SIZE, Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
     otel,
-    service::services,
+    service::services_with_maximum_frame_size,
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -63,6 +63,7 @@ pub struct Broker<G, S> {
     silent: bool,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
+    maximum_frame_size: usize,
 
     cancellation: CancellationToken,
 }
@@ -98,6 +99,7 @@ where
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
+            maximum_frame_size: DEFAULT_MAXIMUM_FRAME_SIZE,
 
             cancellation: CancellationToken::new(),
         }
@@ -314,11 +316,12 @@ where
 
                     stream.set_nodelay(true)?;
 
-                    let service = services(
+                    let service = services_with_maximum_frame_size(
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
-                        self.sasl_config.clone()
+                        self.sasl_config.clone(),
+                        self.maximum_frame_size,
                     )?;
 
                     let handle = set.spawn(async move {
@@ -431,6 +434,7 @@ pub struct Builder<N, C, I, A, S, L> {
     silent: bool,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
+    maximum_frame_size: Option<usize>,
 
     cancellation: CancellationToken,
 }
@@ -464,6 +468,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -484,6 +489,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
 
             cancellation: self.cancellation,
         }
@@ -505,6 +511,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
 
             cancellation: self.cancellation,
         }
@@ -529,6 +536,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
 
             cancellation: self.cancellation,
         }
@@ -585,6 +593,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval,
             transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
 
             cancellation: self.cancellation,
         }
@@ -608,6 +617,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self.maximum_frame_size,
 
             cancellation: self.cancellation,
         }
@@ -650,6 +660,14 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// Set the maximum Kafka request body size, excluding the four-byte frame prefix.
+    pub fn maximum_frame_size(self, maximum_frame_size: usize) -> Self {
+        Self {
+            maximum_frame_size: Some(maximum_frame_size),
+            ..self
+        }
     }
 }
 
@@ -698,7 +716,57 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
+            maximum_frame_size: self
+                .maximum_frame_size
+                .unwrap_or(DEFAULT_MAXIMUM_FRAME_SIZE),
             cancellation: self.cancellation,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rama::{Context, Service as _};
+    use tokio::io::{AsyncWriteExt as _, duplex};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn default_broker_rejects_request_above_maximum_frame_size() {
+        let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
+            .node_id(crate::NODE_ID)
+            .cluster_id("frame-limit-test")
+            .incarnation_id(Uuid::nil())
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092").unwrap())
+            .storage(Url::parse("memory://frame-limit-test").unwrap())
+            .listener(Url::parse("tcp://127.0.0.1:0").unwrap())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(DEFAULT_MAXIMUM_FRAME_SIZE, broker.maximum_frame_size);
+
+        let service = services_with_maximum_frame_size(
+            &broker.cluster_id,
+            broker.groups.clone(),
+            broker.storage.clone(),
+            broker.sasl_config.clone(),
+            broker.maximum_frame_size,
+        )
+        .unwrap();
+        let (mut client, server) = duplex(32);
+        let declared = DEFAULT_MAXIMUM_FRAME_SIZE + 1;
+        client
+            .write_all(&i32::try_from(declared).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.serve(Context::default(), server).await,
+            Err(Error::Service(tansu_service::Error::FrameTooBig {
+                declared: rejected,
+                maximum: DEFAULT_MAXIMUM_FRAME_SIZE,
+            })) if rejected == declared
+        ));
     }
 }

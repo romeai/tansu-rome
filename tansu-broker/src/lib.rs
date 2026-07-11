@@ -59,6 +59,11 @@ impl From<CancelKind> for Duration {
 
 pub const NODE_ID: i32 = 111;
 
+/// Default maximum Kafka request body size, matching Apache Kafka's
+/// `socket.request.max.bytes` default of 100 MiB. The four-byte Kafka frame
+/// prefix is not included in this limit.
+pub const DEFAULT_MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
+
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     global::meter_with_scope(
         InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
