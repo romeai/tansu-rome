@@ -270,10 +270,11 @@ pub use frame::{
 };
 
 pub use stream::{
-    AcceptIntent, BytesLayer, BytesService, BytesTcpService, CloneConnectionService,
-    ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, RequestHead, TcpBytesLayer,
-    TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpListenerError,
-    TcpListenerLayer, TcpListenerService,
+    AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, AdmittedTcpBytesLayer,
+    AdmittedTcpBytesService, BytesLayer, BytesService, BytesTcpService, CloneConnectionService,
+    ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, RequestAdmissionError,
+    RequestHead, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
+    TcpListenerError, TcpListenerLayer, TcpListenerService,
 };
 
 #[derive(Clone, Debug, thiserror::Error)]

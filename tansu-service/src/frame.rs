@@ -31,7 +31,7 @@ use tansu_sans_io::{
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS};
+use crate::{API_ERRORS, API_REQUESTS, AdmittedFrame, AdmittedReply};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -424,6 +424,152 @@ where
             })
             .map_err(Into::into)
         }
+    }
+}
+
+impl<S, State, L> Service<State, AdmittedFrame<L, Bytes>> for BytesFrameService<S>
+where
+    S: Service<State, AdmittedFrame<L, Frame>, Response = AdmittedReply<L, Frame>>,
+    State: Clone + Send + Sync + 'static,
+    L: Send + 'static,
+    S::Error: From<tansu_sans_io::Error> + From<tokio::task::JoinError> + Debug,
+{
+    type Response = AdmittedReply<L, Bytes>;
+    type Error = S::Error;
+
+    #[instrument(skip(ctx, req))]
+    async fn serve(
+        &self,
+        mut ctx: Context<State>,
+        req: AdmittedFrame<L, Bytes>,
+    ) -> Result<Self::Response, Self::Error> {
+        let sasl_handshake_v0 = self
+            .af
+            .as_ref()
+            .and_then(|af| af.v0.lock().ok())
+            .inspect(|v0| debug!(?v0))
+            .map(|v0| v0.unwrap_or_default())
+            .unwrap_or_default();
+
+        debug!(request = ?&req.payload[..], sasl_handshake_v0);
+
+        let frame = if sasl_handshake_v0 {
+            Frame {
+                size: 0,
+                header: Header::Request {
+                    api_key: SaslAuthenticateRequest::KEY,
+                    api_version: 0,
+                    correlation_id: 0,
+                    client_id: None,
+                },
+                body: Body::SaslAuthenticateRequest(
+                    SaslAuthenticateRequest::default().auth_bytes(req.payload.slice(4..)),
+                ),
+            }
+        } else {
+            let encoded = req.payload.clone();
+            spawn_blocking(|| Frame::request_from_bytes(encoded))
+                .await?
+                .inspect(|request| debug!(?request))?
+        };
+
+        let api_key = frame.api_key()?;
+        if !self.is_authenticated(api_key) {
+            return Err(Into::into(tansu_sans_io::Error::NotAuthenticated));
+        }
+
+        let api_version = frame.api_version()?;
+        let correlation_id = frame.correlation_id()?;
+        if !sasl_handshake_v0
+            && (req.head.api_key() != api_key
+                || req.head.api_version() != api_version
+                || req.head.correlation_id() != correlation_id)
+        {
+            return Err(Into::into(tansu_sans_io::Error::Message(
+                "decoded request identity differs from its admitted head".into(),
+            )));
+        }
+
+        if let Some(pb) = ctx.get::<ProgressBar>() {
+            let api_name = frame.api_name();
+            pb.set_message(format!("{api_name} v{api_version}/{correlation_id}"));
+            pb.tick();
+        }
+
+        let attributes = vec![
+            KeyValue::new("api_key", api_key as i64),
+            KeyValue::new("api_version", api_version as i64),
+        ];
+
+        if let Some(authentication) = self.af.as_ref().map(|af| af.authentication.clone()) {
+            assert!(ctx.insert(authentication).is_none());
+        }
+
+        let request = req.map_payload(|_| frame);
+        let response = self
+            .inner
+            .serve(ctx, request)
+            .await
+            .inspect(|response| debug!(?response.payload))?;
+        let AdmittedReply {
+            head,
+            payload: Frame { body, .. },
+            lease,
+        } = response;
+
+        let payload = if sasl_handshake_v0 {
+            if let Some(af) = self.af.as_ref()
+                && af.is_authenticated()
+                && let Ok(mut v0) = af.v0.lock()
+                && v0.is_some()
+            {
+                *v0 = None
+            }
+
+            SaslAuthenticateResponse::try_from(body)
+                .and_then(|response| {
+                    i32::try_from(response.auth_bytes.len())
+                        .map_err(Into::into)
+                        .map(|size| {
+                            let mut frame = BytesMut::new();
+                            frame.put(&size.to_be_bytes()[..]);
+                            frame.put(response.auth_bytes);
+                            Bytes::from(frame)
+                        })
+                })
+                .map_err(S::Error::from)?
+        } else {
+            if let Some(af) = self.af.as_ref()
+                && (api_key == SaslHandshakeRequest::KEY && api_version == 0)
+                && let Ok(mut v0) = af.v0.lock()
+            {
+                *v0 = Some(true)
+            }
+
+            spawn_blocking(move || {
+                Frame::response(
+                    Header::Response { correlation_id },
+                    body,
+                    api_key,
+                    api_version,
+                )
+            })
+            .await?
+            .inspect(|response| {
+                debug!(response = ?response[..]);
+                API_REQUESTS.add(1, &attributes);
+            })
+            .inspect_err(|err| {
+                error!(api_key, api_version, ?err);
+                API_ERRORS.add(1, &attributes);
+            })?
+        };
+
+        Ok(AdmittedReply {
+            head,
+            payload,
+            lease,
+        })
     }
 }
 

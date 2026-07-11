@@ -113,6 +113,146 @@ pub struct RequestHead {
     correlation_id: i32,
 }
 
+/// A complete Kafka frame coupled to the guard that admitted its body.
+///
+/// The guard is deliberately private: downstream services can inspect or map
+/// the payload, but cannot construct an admitted frame, replace its guard, or
+/// detach the guard from the frame.
+///
+/// ```compile_fail
+/// # use bytes::Bytes;
+/// # use tansu_service::{AdmittedFrame, RequestHead};
+/// let frame = AdmittedFrame {
+///     head: todo!(),
+///     payload: Bytes::new(),
+///     lease: (),
+/// };
+/// ```
+#[derive(Debug)]
+pub struct AdmittedFrame<L, T = Bytes> {
+    pub(crate) head: RequestHead,
+    pub(crate) payload: T,
+    pub(crate) lease: L,
+}
+
+/// A request admission guard whose existing reservation can be adjusted.
+///
+/// This is intentionally narrower than exposing `&mut L`: applications can
+/// shrink or otherwise reconcile the reservation after decoding while the
+/// envelope remains the sole owner of the original guard.
+pub trait AdmissionLease {
+    /// The typed adjustment accepted by this lease implementation.
+    type Adjustment;
+
+    /// Failure to apply an adjustment.
+    type Error;
+
+    /// Apply an adjustment to this same lease in place.
+    fn adjust(&mut self, adjustment: Self::Adjustment) -> Result<(), Self::Error>;
+}
+
+impl<L, T> AdmittedFrame<L, T> {
+    /// Return the fixed request head associated with this payload.
+    pub fn head(&self) -> &RequestHead {
+        &self.head
+    }
+
+    /// Borrow the admitted request payload.
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Transform only the payload while preserving the request head and guard.
+    pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> AdmittedFrame<L, U> {
+        AdmittedFrame {
+            head: self.head,
+            payload: map(self.payload),
+            lease: self.lease,
+        }
+    }
+
+    /// Consume this request to create its reply without exposing or replacing
+    /// the admission guard.
+    pub fn reply<U>(self, payload: U) -> AdmittedReply<L, U> {
+        AdmittedReply::from_frame(self, payload)
+    }
+}
+
+impl<L, T> AdmittedFrame<L, T>
+where
+    L: AdmissionLease,
+{
+    /// Adjust the reservation owned by this frame without exposing the guard.
+    pub fn adjust_lease(&mut self, adjustment: L::Adjustment) -> Result<(), L::Error> {
+        self.lease.adjust(adjustment)
+    }
+}
+
+/// A Kafka reply coupled to the guard from the request that produced it.
+///
+/// There is no public constructor or parts accessor. A reply can only be
+/// produced by consuming an [`AdmittedFrame`], which prevents callers from
+/// substituting a different admission guard.
+#[derive(Debug)]
+pub struct AdmittedReply<L, T = Bytes> {
+    pub(crate) head: RequestHead,
+    pub(crate) payload: T,
+    pub(crate) lease: L,
+}
+
+impl<L, T> AdmittedReply<L, T> {
+    pub(crate) fn from_frame<U>(frame: AdmittedFrame<L, U>, payload: T) -> Self {
+        Self {
+            head: frame.head,
+            payload,
+            lease: frame.lease,
+        }
+    }
+
+    /// Return the fixed head from the request that owns this reply.
+    pub fn head(&self) -> &RequestHead {
+        &self.head
+    }
+
+    /// Borrow the reply payload.
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+
+    /// Transform only the payload while preserving the request head and guard.
+    pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> AdmittedReply<L, U> {
+        AdmittedReply {
+            head: self.head,
+            payload: map(self.payload),
+            lease: self.lease,
+        }
+    }
+}
+
+/// Failure of the request-admitted TCP runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum RequestAdmissionError<P, S>
+where
+    P: error::Error + 'static,
+    S: error::Error + 'static,
+{
+    /// Reading or writing the connection failed.
+    #[error("request transport I/O failed")]
+    Io(#[from] io::Error),
+
+    /// The request head or declared frame length was malformed.
+    #[error("invalid Kafka request frame")]
+    Frame(#[source] Error),
+
+    /// Request admission explicitly aborted.
+    #[error("request admission policy aborted")]
+    Policy(#[source] P),
+
+    /// The admitted request service failed fatally.
+    #[error("admitted request service failed")]
+    Service(#[source] S),
+}
+
 impl RequestHead {
     fn decode(
         encoded: [u8; REQUEST_HEAD_BYTES],
@@ -676,6 +816,14 @@ impl<S, State> Layer<S> for TcpBytesLayer<State> {
     }
 }
 
+impl<State> TcpBytesLayer<State> {
+    /// Admit requests with `policy` after reading their fixed head and before
+    /// allocating or reading the remaining body.
+    pub fn with_request_policy<P>(self, policy: P) -> AdmittedTcpBytesLayer<State, P> {
+        AdmittedTcpBytesLayer::new(policy)
+    }
+}
+
 /// A [`Service`] receiving [`Bytes`] from a [`TcpStream`], calling an inner [`Service`] and sending [`Bytes`] into the [`TcpStream`]
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TcpBytesService<S, State> {
@@ -694,6 +842,198 @@ impl<S, State> TcpBytesService<S, State> {
         start
             .elapsed()
             .map_or(0, |duration| duration.as_millis() as u64)
+    }
+}
+
+/// A [`Layer`] that admits a Kafka request after its fixed head is read and
+/// before storage for the complete frame is allocated.
+#[derive(Clone, Debug)]
+pub struct AdmittedTcpBytesLayer<State, P> {
+    policy: P,
+    _state: PhantomData<State>,
+}
+
+impl<State, P> AdmittedTcpBytesLayer<State, P> {
+    /// Create an admitted TCP byte layer using the Rama request `policy`.
+    pub fn new(policy: P) -> Self {
+        Self {
+            policy,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<S, State, P> Layer<S> for AdmittedTcpBytesLayer<State, P>
+where
+    P: Clone,
+{
+    type Service = AdmittedTcpBytesService<S, State, P>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AdmittedTcpBytesService {
+            inner,
+            policy: self.policy.clone(),
+            _state: PhantomData,
+        }
+    }
+}
+
+/// A TCP connection service whose request bodies are guarded by a Rama policy.
+#[derive(Clone, Debug)]
+pub struct AdmittedTcpBytesService<S, State, P> {
+    inner: S,
+    policy: P,
+    _state: PhantomData<State>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReadHeadError {
+    #[error("request head I/O failed")]
+    Io(#[from] io::Error),
+
+    #[error("invalid Kafka request head")]
+    Frame(#[from] Error),
+}
+
+impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
+    async fn read_head<R>(
+        &self,
+        stream: &mut R,
+        maximum_frame_size: Option<usize>,
+    ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), ReadHeadError>
+    where
+        R: AsyncReadExt + Unpin,
+    {
+        let mut encoded = [0u8; REQUEST_HEAD_BYTES];
+        _ = stream
+            .read_exact(&mut encoded[..FRAME_LENGTH_PREFIX_BYTES])
+            .await?;
+
+        let length_prefix = encoded[..FRAME_LENGTH_PREFIX_BYTES]
+            .try_into()
+            .expect("the request head contains a complete length prefix");
+        // This error is converted by `request`; keeping I/O separate here
+        // makes it impossible to confuse a policy rejection with malformed
+        // wire input.
+        let length = FrameLength::request(length_prefix, maximum_frame_size)?;
+
+        _ = stream
+            .read_exact(&mut encoded[FRAME_LENGTH_PREFIX_BYTES..])
+            .await?;
+        let (head, _) = RequestHead::decode(encoded, maximum_frame_size)?;
+        Ok((head, length, encoded))
+    }
+
+    async fn admit(
+        &self,
+        mut ctx: Context<State>,
+        mut request: RequestHead,
+    ) -> Result<(Context<State>, RequestHead, P::Guard), P::Error>
+    where
+        P: Policy<State, RequestHead>,
+        State: Clone + Send + Sync + 'static,
+    {
+        loop {
+            let result = self.policy.check(ctx, request).await;
+            ctx = result.ctx;
+            request = result.request;
+
+            match result.output {
+                PolicyOutput::Ready(guard) => return Ok((ctx, request, guard)),
+                PolicyOutput::Retry => continue,
+                PolicyOutput::Abort(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn request<R>(
+        &self,
+        stream: &mut R,
+        maximum_frame_size: Option<usize>,
+        ctx: Context<State>,
+    ) -> Result<(), RequestAdmissionError<P::Error, S::Error>>
+    where
+        S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard>>,
+        P: Policy<State, RequestHead>,
+        P::Error: error::Error + 'static,
+        S::Error: error::Error + 'static,
+        State: Clone + Send + Sync + 'static,
+        R: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
+        let (wire_head, length, encoded_head) = self
+            .read_head(stream, maximum_frame_size)
+            .await
+            .map_err(|error| match error {
+                ReadHeadError::Io(error) => RequestAdmissionError::Io(error),
+                ReadHeadError::Frame(error) => RequestAdmissionError::Frame(error),
+            })?;
+        let (ctx, admitted_head, lease) = self
+            .admit(ctx, wire_head)
+            .await
+            .map_err(RequestAdmissionError::Policy)?;
+
+        // A Rama policy may carry a request through retries, but changing the
+        // protocol identity would separate admission from the bytes it guards.
+        if admitted_head != wire_head {
+            return Err(RequestAdmissionError::Frame(Error::Message(
+                "request policy changed the Kafka request head".into(),
+            )));
+        }
+
+        let mut request = vec![0u8; length.complete];
+        request[..REQUEST_HEAD_BYTES].copy_from_slice(&encoded_head);
+        _ = stream
+            .read_exact(&mut request[REQUEST_HEAD_BYTES..])
+            .await?;
+        BYTES_RECEIVED.add(request.len() as u64, &[]);
+
+        let reply = self
+            .inner
+            .serve(
+                ctx,
+                AdmittedFrame {
+                    head: wire_head,
+                    payload: Bytes::from(request),
+                    lease,
+                },
+            )
+            .await
+            .map_err(RequestAdmissionError::Service)?;
+
+        let AdmittedReply { payload, lease, .. } = reply;
+        let _lease = lease;
+        let mut writer = BufWriter::new(stream);
+        writer.write_all(&payload).await?;
+        BYTES_SENT.add(payload.len() as u64, &[]);
+        writer.flush().await?;
+        Ok(())
+    }
+}
+
+impl<S, State, P, Stream> Service<TcpContext, Stream> for AdmittedTcpBytesService<S, State, P>
+where
+    S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard>>,
+    P: Policy<State, RequestHead>,
+    P::Error: error::Error + 'static,
+    S::Error: error::Error + 'static,
+    State: Clone + Default + Send + Sync + 'static,
+    Stream: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+{
+    type Response = ();
+    type Error = RequestAdmissionError<P::Error, S::Error>;
+
+    async fn serve(
+        &self,
+        ctx: Context<TcpContext>,
+        mut stream: Stream,
+    ) -> Result<Self::Response, Self::Error> {
+        let maximum_frame_size = ctx.state().maximum_frame_size;
+        let (ctx, _) = ctx.swap_state(State::default());
+
+        loop {
+            self.request(&mut stream, maximum_frame_size, ctx.clone())
+                .await?;
+        }
     }
 }
 
@@ -923,14 +1263,108 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AcceptIntent, ConnectionInfo, FixedConnectionPolicy, FrameLength, RequestHead,
-        TcpBytesLayer, TcpContext, TcpListenerService,
+        AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo,
+        FixedConnectionPolicy, FrameLength, RequestAdmissionError, RequestHead, TcpBytesLayer,
+        TcpContext, TcpListenerService,
     };
     use crate::Error;
 
     #[derive(Clone, Debug)]
     struct EchoService {
         calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RequestPolicy {
+        gate: Arc<Semaphore>,
+        started: mpsc::UnboundedSender<RequestHead>,
+        drops: Arc<AtomicUsize>,
+        abort: bool,
+    }
+
+    #[derive(Debug)]
+    struct RequestLease {
+        id: usize,
+        drops: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct AdjustableLease {
+        identity: usize,
+        reservation: usize,
+    }
+
+    impl AdmissionLease for AdjustableLease {
+        type Adjustment = usize;
+        type Error = std::convert::Infallible;
+
+        fn adjust(&mut self, adjustment: Self::Adjustment) -> Result<(), Self::Error> {
+            self.reservation = adjustment;
+            Ok(())
+        }
+    }
+
+    impl Drop for RequestLease {
+        fn drop(&mut self) {
+            _ = self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Policy<(), RequestHead> for RequestPolicy {
+        type Guard = RequestLease;
+        type Error = io::Error;
+
+        async fn check(
+            &self,
+            ctx: Context<()>,
+            request: RequestHead,
+        ) -> PolicyResult<(), RequestHead, Self::Guard, Self::Error> {
+            self.started.send(request).unwrap();
+            let output = if self.abort {
+                PolicyOutput::Abort(io::Error::other("request denied"))
+            } else {
+                match self.gate.clone().acquire_owned().await {
+                    Ok(permit) => {
+                        permit.forget();
+                        PolicyOutput::Ready(RequestLease {
+                            id: request.correlation_id() as usize,
+                            drops: self.drops.clone(),
+                        })
+                    }
+                    Err(error) => PolicyOutput::Abort(io::Error::other(error.to_string())),
+                }
+            };
+            PolicyResult {
+                ctx,
+                request,
+                output,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AdmittedEchoService {
+        observed_lease: mpsc::UnboundedSender<usize>,
+        fail: bool,
+    }
+
+    impl rama::Service<(), AdmittedFrame<RequestLease>> for AdmittedEchoService {
+        type Response = AdmittedReply<RequestLease>;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            req: AdmittedFrame<RequestLease>,
+        ) -> Result<Self::Response, Self::Error> {
+            self.observed_lease.send(req.lease.id).unwrap();
+            if self.fail {
+                Err(Error::Message("handler failed".into()))
+            } else {
+                let payload = req.payload().clone();
+                Ok(req.reply(payload))
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -1174,6 +1608,28 @@ mod tests {
         assert_eq!(12, length.complete);
     }
 
+    #[test]
+    fn admitted_frame_adjusts_the_original_lease_without_exposing_it() {
+        let mut frame = AdmittedFrame {
+            head: RequestHead {
+                body_len: 8,
+                api_key: 3,
+                api_version: 1,
+                correlation_id: 42,
+            },
+            payload: bytes::Bytes::new(),
+            lease: AdjustableLease {
+                identity: 91,
+                reservation: 1_024,
+            },
+        };
+
+        frame.adjust_lease(128).unwrap();
+        let reply = frame.map_payload(|_| ()).reply(bytes::Bytes::new());
+        assert_eq!(91, reply.lease.identity);
+        assert_eq!(128, reply.lease.reservation);
+    }
+
     #[tokio::test]
     async fn rejected_length_never_enters_inner_service() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1257,6 +1713,138 @@ mod tests {
 
         client.shutdown().await.unwrap();
         assert!(matches!(server.await.unwrap(), Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn pending_request_policy_stops_body_reads_before_allocation() {
+        let gate = Arc::new(Semaphore::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: gate.clone(),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(16);
+        let mut request = vec![0u8; 68];
+        request[..4].copy_from_slice(&64_i32.to_be_bytes());
+        request[4..6].copy_from_slice(&3_i16.to_be_bytes());
+        request[6..8].copy_from_slice(&1_i16.to_be_bytes());
+        request[8..12].copy_from_slice(&41_i32.to_be_bytes());
+
+        let server = tokio::spawn(async move {
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(64))),
+                    server,
+                )
+                .await
+        });
+        let writer = tokio::spawn(async move {
+            client.write_all(&request).await.unwrap();
+            let mut response = vec![0u8; request.len()];
+            _ = client.read_exact(&mut response).await.unwrap();
+            response
+        });
+
+        let head = timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(64, head.body_len());
+        assert!(
+            timeout(Duration::from_millis(50), observed_rx.recv())
+                .await
+                .is_err()
+        );
+        assert!(!writer.is_finished());
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+
+        gate.add_permits(1);
+        assert_eq!(41, observed_rx.recv().await.unwrap());
+        let response = writer.await.unwrap();
+        assert_eq!(64_i32.to_be_bytes(), response[..4]);
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(RequestAdmissionError::Io(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_policy_abort_is_distinct_from_a_protocol_denial() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(1)),
+                started: started_tx,
+                drops,
+                abort: true,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(32);
+        client
+            .write_all(&[0, 0, 0, 8, 0x7f, 0xff, 0, 1, 0, 0, 0, 9])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(8))),
+                    server,
+                )
+                .await,
+            Err(RequestAdmissionError::Policy(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fatal_handler_error_drops_the_exact_request_lease_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(1)),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: true,
+            });
+        let (mut client, server) = duplex(32);
+        client
+            .write_all(&[0, 0, 0, 8, 0, 3, 0, 1, 0, 0, 0, 73])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(8))),
+                    server,
+                )
+                .await,
+            Err(RequestAdmissionError::Service(Error::Message(message)))
+                if message == "handler failed"
+        ));
+        assert_eq!(73, observed_rx.recv().await.unwrap());
+        assert_eq!(1, drops.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
