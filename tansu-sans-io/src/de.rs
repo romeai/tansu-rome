@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{DecodeLimit, DecodeLimits, Error, Result, RootMessageMeta};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use serde::{
     Deserializer,
     de::{DeserializeSeed, EnumAccess, SeqAccess, VariantAccess, Visitor},
@@ -23,6 +23,7 @@ use std::{
     collections::VecDeque,
     fmt,
     io::Read,
+    mem::size_of,
     str::from_utf8,
 };
 use tansu_model::{FieldMeta, MessageMeta};
@@ -712,7 +713,8 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
 
         let length = if self.is_flexible() {
             self.unsigned_varint()
-                .and_then(|length| usize::try_from(length - 1).map_err(Into::into))?
+                .and_then(|length| length.checked_sub(1).ok_or(Error::Overflow))
+                .and_then(|length| usize::try_from(length).map_err(Into::into))?
         } else {
             let mut buf = [0u8; 4];
 
@@ -1150,22 +1152,37 @@ impl<'de> SeqAccess<'de> for Batch {
         );
 
         if self.encoded.has_remaining() {
-            let base_offset = self.encoded.try_get_i64()?;
-            let batch_length = self.encoded.try_get_i32()?;
-            debug!(base_offset, batch_length);
+            /// Bytes occupied by a Kafka record batch's `base_offset` and `batch_length` fields.
+            const BATCH_PREFIX_BYTES: usize = size_of::<i64>() + size_of::<i32>();
 
-            let mut batch = BytesMut::with_capacity(batch_length as usize);
-            batch.put_i64(base_offset);
-            batch.put_i32(batch_length);
-
-            if (batch_length as usize) > self.encoded.len() {
+            if self.encoded.remaining() < BATCH_PREFIX_BYTES {
                 return Err(Error::Overflow);
             }
 
-            batch.put(self.encoded.split_to(batch_length as usize));
+            let base_offset = i64::from_be_bytes(
+                self.encoded[..size_of::<i64>()]
+                    .try_into()
+                    .map_err(|_| Error::Overflow)?,
+            );
+            let batch_length = i32::from_be_bytes(
+                self.encoded[size_of::<i64>()..BATCH_PREFIX_BYTES]
+                    .try_into()
+                    .map_err(|_| Error::Overflow)?,
+            );
+            debug!(base_offset, batch_length);
+
+            let batch_length = usize::try_from(batch_length)?;
+            let encoded_batch_length = BATCH_PREFIX_BYTES
+                .checked_add(batch_length)
+                .ok_or(Error::Overflow)?;
+            // Validate the peer's length against bytes already held in the bounded records field.
+            // Splitting only after this check stays zero-copy and never reserves peer-sized capacity.
+            if encoded_batch_length > self.encoded.remaining() {
+                return Err(Error::Overflow);
+            }
 
             let decoder = BatchDecoder {
-                encoded: batch.freeze(),
+                encoded: self.encoded.split_to(encoded_batch_length),
             };
 
             seed.deserialize(decoder).map(Some)
