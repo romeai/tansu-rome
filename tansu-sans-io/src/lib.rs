@@ -457,6 +457,7 @@ pub enum Error {
     TryFromInt(#[from] num::TryFromIntError),
     TryFromSlice(#[from] TryFromSliceError),
     TryGet(Arc<TryGetError>),
+    TrailingFrameBytes(usize),
     UnexpectedType(String),
     UnknownApiErrorCode(i16),
     UnknownAssignor(String),
@@ -694,12 +695,12 @@ impl Frame {
 
     /// Deserialize one complete length-prefixed API request frame under explicit resource limits.
     ///
-    /// Unlike a stream decoder, this entry point requires exactly one frame: the signed length
-    /// prefix must equal the remaining input length. Length-delimited values and arrays are checked
-    /// before allocation or traversal.
+    /// The input must contain exactly one frame: its prefix must equal the number of following
+    /// bytes, and decoding must consume all of them. The complete frame and every peer-declared
+    /// value are checked before the decoder allocates or traverses that value.
     #[instrument(skip_all)]
     pub fn request_from_bytes_with_limits(
-        encoded: impl Buf,
+        mut encoded: impl Buf,
         limits: DecodeLimits,
     ) -> Result<Frame> {
         let start = SystemTime::now();
@@ -727,8 +728,16 @@ impl Frame {
             Some(frame_bytes - size_of::<i32>()),
             frame_bytes,
         )?;
-        Frame::deserialize(&mut deserializer)
-            .inspect(|frame| debug!(?frame, elapsed_millis = Self::elapsed_millis(start)))
+        let frame = Frame::deserialize(&mut deserializer)?;
+        drop(deserializer);
+
+        let remaining = reader.get_ref().remaining();
+        if remaining > 0 {
+            return Err(Error::TrailingFrameBytes(remaining));
+        }
+
+        debug!(?frame, elapsed_millis = Self::elapsed_millis(start));
+        Ok(frame)
     }
 
     /// serialize an API response into a frame of bytes

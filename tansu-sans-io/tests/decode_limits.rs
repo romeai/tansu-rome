@@ -15,8 +15,10 @@
 use bytes::Bytes;
 use tansu_sans_io::{
     ApiKey as _, ApiVersionsRequest, DecodeLimit, DecodeLimits, Error, Frame, Header,
-    MetadataRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
+    MetadataRequest, ProduceRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
     metadata_request::MetadataRequestTopic,
+    produce_request::{PartitionProduceData, TopicProduceData},
+    record::{Record, deflated, inflated},
 };
 
 fn append_unsigned_varint(encoded: &mut Vec<u8>, mut value: u32) {
@@ -80,6 +82,39 @@ fn metadata(api_version: i16) -> tansu_sans_io::Result<Bytes> {
             .allow_auto_topic_creation((api_version >= 4).then_some(false))
             .include_cluster_authorized_operations((8..=10).contains(&api_version).then_some(false))
             .include_topic_authorized_operations((api_version >= 8).then_some(false))
+            .into(),
+    )
+}
+
+fn produce_with_one_batch(base_offset: i64) -> tansu_sans_io::Result<Bytes> {
+    let batch = inflated::Batch::builder()
+        .base_offset(base_offset)
+        .record(Record::builder().value(Some(Bytes::from_static(b"value"))))
+        .producer_id(-1)
+        .producer_epoch(-1)
+        .build()?;
+    let records: deflated::Frame = inflated::Frame {
+        batches: [batch].into(),
+    }
+    .try_into()?;
+
+    Frame::request(
+        header(ProduceRequest::KEY, 9),
+        ProduceRequest::default()
+            .transactional_id(None)
+            .acks(1)
+            .timeout_ms(1_000)
+            .topic_data(Some(
+                [TopicProduceData::default()
+                    .name("orders".into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(0)
+                            .records(Some(records))]
+                        .into(),
+                    ))]
+                .into(),
+            ))
             .into(),
     )
 }
@@ -350,5 +385,98 @@ fn aggregate_work_includes_input_and_structural_visits() -> tansu_sans_io::Resul
         Frame::request_from_bytes_with_limits(&encoded[..], limits).unwrap_err(),
         DecodeLimit::TotalWorkUnits,
     );
+    Ok(())
+}
+
+#[test]
+fn frame_prefix_must_match_the_complete_input() -> tansu_sans_io::Result<()> {
+    let encoded = sasl_handshake()?;
+
+    let mut declares_too_many = encoded.to_vec();
+    declares_too_many[..4].copy_from_slice(&i32::try_from(encoded.len())?.to_be_bytes());
+    assert!(matches!(
+        Frame::request_from_bytes(&declares_too_many[..]),
+        Err(Error::FrameSizeMismatch { .. })
+    ));
+
+    let mut declares_too_few = encoded.to_vec();
+    let declared = i32::from_be_bytes(declares_too_few[..4].try_into()?);
+    declares_too_few[..4].copy_from_slice(&(declared - 1).to_be_bytes());
+    assert!(matches!(
+        Frame::request_from_bytes(&declares_too_few[..]),
+        Err(Error::FrameSizeMismatch { .. })
+    ));
+
+    let mut negative = encoded.to_vec();
+    negative[..4].copy_from_slice(&(-1_i32).to_be_bytes());
+    assert!(matches!(
+        Frame::request_from_bytes(&negative[..]),
+        Err(Error::InvalidFrameSize(-1))
+    ));
+    Ok(())
+}
+
+#[test]
+fn one_frame_must_consume_the_declared_input() -> tansu_sans_io::Result<()> {
+    let encoded = sasl_handshake()?;
+
+    let mut concatenated = encoded.to_vec();
+    concatenated.extend_from_slice(&encoded);
+    assert!(matches!(
+        Frame::request_from_bytes(&concatenated[..]),
+        Err(Error::FrameSizeMismatch { .. })
+    ));
+
+    let mut trailing = encoded.to_vec();
+    trailing.extend_from_slice(&[0xAA, 0xBB]);
+    let payload_bytes = trailing.len() - size_of::<i32>();
+    trailing[..4].copy_from_slice(&i32::try_from(payload_bytes)?.to_be_bytes());
+    assert!(matches!(
+        Frame::request_from_bytes(&trailing[..]),
+        Err(Error::TrailingFrameBytes(2))
+    ));
+    Ok(())
+}
+
+#[test]
+fn zero_compact_bytes_length_is_an_error_not_a_panic() -> tansu_sans_io::Result<()> {
+    let encoded = Frame::request(
+        header(SaslAuthenticateRequest::KEY, 2),
+        SaslAuthenticateRequest::default()
+            .auth_bytes(Bytes::from_static(b"proof"))
+            .into(),
+    )?;
+    let mut forged = encoded.to_vec();
+    let proof = forged
+        .windows(b"proof".len())
+        .position(|window| window == b"proof")
+        .expect("encoded request contains its authentication bytes");
+    forged[proof - 1] = 0;
+
+    assert!(Frame::request_from_bytes(&forged[..]).is_err());
+    Ok(())
+}
+
+#[test]
+fn peer_batch_length_is_validated_before_batch_allocation() -> tansu_sans_io::Result<()> {
+    /// Distinctive record-batch offset used to locate the batch prefix in the encoded fixture.
+    const BASE_OFFSET: i64 = 0x0102_0304_0506_0708;
+
+    let encoded = produce_with_one_batch(BASE_OFFSET)?;
+    let batch = encoded
+        .windows(size_of::<i64>())
+        .position(|window| window == BASE_OFFSET.to_be_bytes())
+        .expect("encoded request contains the record batch base offset");
+    let batch_length = batch + size_of::<i64>();
+
+    for invalid_length in [-1_i32, i32::MAX] {
+        let mut forged = encoded.to_vec();
+        forged[batch_length..batch_length + size_of::<i32>()]
+            .copy_from_slice(&invalid_length.to_be_bytes());
+        assert!(
+            Frame::request_from_bytes(&forged[..]).is_err(),
+            "batch length {invalid_length} must be rejected"
+        );
+    }
     Ok(())
 }
