@@ -12,15 +12,98 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::Cursor;
+use std::io::{self, Write};
 
-use crate::{AuthError, Authentication, Error, Stage};
+use crate::{AuthError, Authentication, Error, SaslLimits, Stage};
 use bytes::Bytes;
 use rama::{Context, Service};
 use rsasl::prelude::State;
 use tansu_sans_io::{ApiKey, ErrorCode, SaslAuthenticateRequest, SaslAuthenticateResponse};
 use tokio::task;
 use tracing::debug;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LimitExceeded {
+    Token { length: usize, maximum: usize },
+    Transcript { length: usize, maximum: usize },
+}
+
+impl From<LimitExceeded> for AuthError {
+    fn from(value: LimitExceeded) -> Self {
+        match value {
+            LimitExceeded::Token { length, maximum } => Self::TokenTooLarge { length, maximum },
+            LimitExceeded::Transcript { length, maximum } => {
+                Self::TranscriptTooLarge { length, maximum }
+            }
+        }
+    }
+}
+
+struct BoundedTokenWriter {
+    bytes: Vec<u8>,
+    limits: SaslLimits,
+    transcript_before_output: usize,
+    exceeded: Option<LimitExceeded>,
+}
+
+impl BoundedTokenWriter {
+    fn new(limits: SaslLimits, transcript_before_output: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limits,
+            transcript_before_output,
+            exceeded: None,
+        }
+    }
+
+    fn into_parts(self) -> (Vec<u8>, Option<LimitExceeded>) {
+        (self.bytes, self.exceeded)
+    }
+}
+
+impl Write for BoundedTokenWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let token_length = self.bytes.len().saturating_add(buf.len());
+        let transcript_length = self.transcript_before_output.saturating_add(token_length);
+
+        let exceeded = if token_length > self.limits.maximum_token_size() {
+            Some(LimitExceeded::Token {
+                length: token_length,
+                maximum: self.limits.maximum_token_size(),
+            })
+        } else if transcript_length > self.limits.maximum_transcript_size() {
+            Some(LimitExceeded::Transcript {
+                length: transcript_length,
+                maximum: self.limits.maximum_transcript_size(),
+            })
+        } else {
+            None
+        };
+
+        if let Some(exceeded) = exceeded {
+            self.exceeded = Some(exceeded);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SASL exchange exceeded its configured bound",
+            ));
+        }
+
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn authentication_failed() -> SaslAuthenticateResponse {
+    SaslAuthenticateResponse::default()
+        .error_code(ErrorCode::SaslAuthenticationFailed.into())
+        .error_message(Some(ErrorCode::SaslAuthenticationFailed.to_string()))
+        .auth_bytes(Bytes::from_static(b""))
+        .session_lifetime_ms(Some(0))
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SaslAuthenticateService {
@@ -69,28 +152,59 @@ where
                     .map_err(Into::into)
                     .map(|mut guard| {
                         if let Some(Stage::Session(session)) = guard.as_mut() {
-                            let mut outcome = Cursor::new(Vec::new());
+                            let input_length = req.auth_bytes.len();
+                            let input_exceeded =
+                                if input_length > authentication.limits.maximum_token_size() {
+                                    Some(LimitExceeded::Token {
+                                        length: input_length,
+                                        maximum: authentication.limits.maximum_token_size(),
+                                    })
+                                } else {
+                                    let transcript_length =
+                                        session.transcript_size.saturating_add(input_length);
 
-                            let Ok(state) = session
+                                    (transcript_length
+                                        > authentication.limits.maximum_transcript_size())
+                                    .then_some(LimitExceeded::Transcript {
+                                        length: transcript_length,
+                                        maximum: authentication.limits.maximum_transcript_size(),
+                                    })
+                                };
+
+                            if let Some(exceeded) = input_exceeded {
+                                _ = guard.replace(Stage::Finished(Err(exceeded.into())));
+                                return authentication_failed();
+                            }
+
+                            let transcript_before_output = session.transcript_size + input_length;
+                            let mut outcome = BoundedTokenWriter::new(
+                                authentication.limits,
+                                transcript_before_output,
+                            );
+
+                            let state = session
+                                .session
                                 .step(Some(&req.auth_bytes), &mut outcome)
                                 .inspect(|state| debug!(?state))
-                                .inspect_err(|err| debug!(?err))
-                            else {
-                                _ = guard.take();
+                                .inspect_err(|err| debug!(?err));
+                            let (auth_bytes, output_exceeded) = outcome.into_parts();
 
-                                return SaslAuthenticateResponse::default()
-                                    .error_code(ErrorCode::SaslAuthenticationFailed.into())
-                                    .error_message(Some(
-                                        ErrorCode::SaslAuthenticationFailed.to_string(),
-                                    ))
-                                    .auth_bytes(Bytes::from_static(b""))
-                                    .session_lifetime_ms(Some(0));
+                            let Ok(state) = state else {
+                                if let Some(exceeded) = output_exceeded {
+                                    _ = guard.replace(Stage::Finished(Err(exceeded.into())));
+                                } else {
+                                    _ = guard.take();
+                                }
+
+                                return authentication_failed();
                             };
 
-                            let auth_bytes = Bytes::from(outcome.into_inner());
+                            session.transcript_size = transcript_before_output + auth_bytes.len();
+                            let auth_bytes = Bytes::from(auth_bytes);
 
                             if let State::Finished(_) = state {
                                 let verdict = session
+                                    .session
                                     .validation()
                                     .unwrap_or(Err(AuthError::MissingValidation));
                                 let authenticated = verdict.is_ok();
@@ -133,5 +247,44 @@ where
                 .auth_bytes(Bytes::from_static(b""))
                 .session_lifetime_ms(Some(0)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_output_token_is_rejected_before_vector_growth() {
+        let limits = SaslLimits::new(4, 16).expect("valid bounds");
+        let mut writer = BoundedTokenWriter::new(limits, 0);
+
+        assert!(writer.write_all(b"12345").is_err());
+        let (bytes, exceeded) = writer.into_parts();
+        assert!(bytes.is_empty());
+        assert_eq!(
+            Some(LimitExceeded::Token {
+                length: 5,
+                maximum: 4,
+            }),
+            exceeded,
+        );
+    }
+
+    #[test]
+    fn oversized_output_transcript_is_rejected_before_vector_growth() {
+        let limits = SaslLimits::new(8, 4).expect("valid bounds");
+        let mut writer = BoundedTokenWriter::new(limits, 3);
+
+        assert!(writer.write_all(b"12").is_err());
+        let (bytes, exceeded) = writer.into_parts();
+        assert!(bytes.is_empty());
+        assert_eq!(
+            Some(LimitExceeded::Transcript {
+                length: 5,
+                maximum: 4,
+            }),
+            exceeded,
+        );
     }
 }

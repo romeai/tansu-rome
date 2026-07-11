@@ -23,7 +23,7 @@ use indicatif::ProgressBar;
 use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service, context::Extensions, matcher::Matcher, service::BoxService};
 use rsasl::config::SASLConfig;
-use tansu_auth::Authentication;
+use tansu_auth::{Authentication, SaslLimits};
 use tansu_sans_io::{
     ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, Response, RootMessageMeta,
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
@@ -43,7 +43,7 @@ where
     State: Clone + Debug,
 {
     fn matches(&self, ext: Option<&mut Extensions>, ctx: &Context<State>, req: &Q) -> bool {
-        debug!(?ext, ?ctx, ?req);
+        let _ = (ext, ctx, req);
         Q::KEY == self.0
     }
 }
@@ -114,11 +114,7 @@ where
 
     #[instrument(skip(ctx, req))]
     async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
-        debug!(?req);
-        self.inner
-            .serve(ctx, req)
-            .await
-            .inspect(|response| debug!(?response))
+        self.inner.serve(ctx, req).await
     }
 }
 
@@ -200,20 +196,40 @@ where
     State: Clone + Debug,
 {
     fn matches(&self, ext: Option<&mut Extensions>, ctx: &Context<State>, req: &Frame) -> bool {
-        debug!(?ext, ?ctx, ?req);
+        let _ = (ext, ctx);
         req.api_key().is_ok_and(|api_key| api_key == Q::KEY)
     }
 }
 
 /// A [`Layer`] that transforms [`Bytes`] into [`Frame`]s
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BytesFrameLayer {
     sasl_config: Option<Arc<SASLConfig>>,
+    sasl_limits: SaslLimits,
 }
 
 impl BytesFrameLayer {
     pub fn with_sasl_config(self, sasl_config: Option<Arc<SASLConfig>>) -> Self {
-        Self { sasl_config }
+        Self {
+            sasl_config,
+            ..self
+        }
+    }
+
+    pub fn with_sasl_limits(self, sasl_limits: SaslLimits) -> Self {
+        Self {
+            sasl_limits,
+            ..self
+        }
+    }
+}
+
+impl Debug for BytesFrameLayer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(BytesFrameLayer))
+            .field("sasl_configured", &self.sasl_config.is_some())
+            .field("sasl_limits", &self.sasl_limits)
+            .finish()
     }
 }
 
@@ -227,7 +243,10 @@ impl<S> Layer<S> for BytesFrameLayer {
                 .sasl_config
                 .clone()
                 .map(|sasl_config| AuthenticationFrame {
-                    authentication: Authentication::server(sasl_config),
+                    authentication: Authentication::server_with_limits(
+                        sasl_config,
+                        self.sasl_limits,
+                    ),
                     v0: Arc::new(Mutex::new(None)),
                 }),
         }
@@ -293,7 +312,7 @@ where
             .map(|v0| v0.unwrap_or_default())
             .unwrap_or_default();
 
-        debug!(request = ?&req[..], sasl_handshake_v0);
+        debug!(request_length = req.len(), sasl_handshake_v0);
 
         let req = if sasl_handshake_v0 {
             //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
@@ -315,9 +334,7 @@ where
                 ),
             }
         } else {
-            spawn_blocking(|| Frame::request_from_bytes(req))
-                .await?
-                .inspect(|request| debug!(?request))?
+            spawn_blocking(|| Frame::request_from_bytes(req)).await??
         };
 
         let api_key = req.api_key()?;
@@ -346,10 +363,7 @@ where
                 assert!(ctx.insert(authentication).is_none());
             }
 
-            self.inner
-                .serve(ctx, req)
-                .await
-                .inspect(|response| debug!(?response))?
+            self.inner.serve(ctx, req).await?
         };
 
         if sasl_handshake_v0 {
@@ -401,7 +415,7 @@ where
             })
             .await?
             .inspect(|response| {
-                debug!(response = ?response[..]);
+                debug!(response_length = response.len());
                 API_REQUESTS.add(1, &attributes);
             })
             .inspect_err(|err| {
@@ -448,20 +462,14 @@ where
 
     #[instrument(skip(ctx, req), fields(api_key = req.api_key()?, api_version = req.api_version()?, correlation_id = req.correlation_id()?))]
     async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        debug!(?req);
-
         let api_key = req.api_key()?;
         let api_version = req.api_version()?;
 
         let req = Frame::request(req.header, req.body)?;
 
-        self.inner
-            .serve(ctx, req)
-            .await
-            .and_then(|response| {
-                Frame::response_from_bytes(response, api_key, api_version).map_err(Into::into)
-            })
-            .inspect(|response| debug!(?response))
+        self.inner.serve(ctx, req).await.and_then(|response| {
+            Frame::response_from_bytes(response, api_key, api_version).map_err(Into::into)
+        })
     }
 }
 
@@ -592,8 +600,6 @@ where
 
     #[instrument(skip_all)]
     async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
-        debug!(?req);
-
         let api_key = Q::KEY;
         let api_version = RootMessageMeta::messages()
             .requests()
@@ -618,7 +624,6 @@ where
             .serve(ctx, req)
             .await
             .and_then(|response| Q::Response::try_from(response.body).map_err(Into::into))
-            .inspect(|response| debug!(?response))
     }
 }
 
@@ -743,6 +748,7 @@ impl<F> ResponseService<F> {
 mod tests {
     use rama::Layer as _;
     use rsasl::config::SASLConfig;
+    use tansu_auth::SaslLimits;
 
     use super::{BytesFrameLayer, BytesFrameService};
 
@@ -759,5 +765,23 @@ mod tests {
         let first = first.af.expect("authentication state");
         let second = second.af.expect("authentication state");
         assert!(!std::sync::Arc::ptr_eq(&first.v0, &second.v0));
+    }
+
+    #[test]
+    fn bytes_frame_layer_debug_redacts_sasl_configuration() {
+        let sasl_config = SASLConfig::with_credentials(
+            None,
+            "debug-principal".to_owned(),
+            "debug-password".to_owned(),
+        )
+        .expect("SASL configuration");
+        let layer = BytesFrameLayer::default()
+            .with_sasl_config(Some(sasl_config))
+            .with_sasl_limits(SaslLimits::new(8 * 1024, 32 * 1024).expect("valid bounds"));
+
+        let debug = format!("{layer:?}");
+        assert!(debug.contains("sasl_configured: true"));
+        assert!(!debug.contains("debug-principal"));
+        assert!(!debug.contains("debug-password"));
     }
 }
