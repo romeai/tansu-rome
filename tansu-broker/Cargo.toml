@@ -71,6 +71,7 @@ uuid.workspace = true
 anyhow.workspace = true
 object_store = { workspace = true }
 pretty_assertions.workspace = true
+rsasl = { workspace = true, features = ["plain"] }
 slatedb = { workspace = true }
 tansu-schema = { workspace = true }
 tansu-storage = { workspace = true }

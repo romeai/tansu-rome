@@ -769,6 +769,49 @@ async fn authentication_requires_a_verified_principal_and_is_connection_local() 
 }
 
 #[tokio::test]
+async fn sasl_handshake_only_offers_credential_verifying_mechanisms() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let engine = Engine::default();
+    let broker = tansu_auth::configuration(engine.clone())
+        .map_err(Error::from)
+        .map(Some)
+        .and_then(|sasl_config| broker(engine, sasl_config))?;
+
+    for (correlation_id, requested) in ["PLAIN", "OAUTHBEARER"].into_iter().enumerate() {
+        let response = broker
+            .serve(
+                Context::default(),
+                Frame::request(
+                    Header::Request {
+                        api_key: SaslHandshakeRequest::KEY,
+                        api_version: 1,
+                        correlation_id: correlation_id as i32,
+                        client_id: Some("auth-regression".into()),
+                    },
+                    Body::SaslHandshakeRequest(
+                        SaslHandshakeRequest::default().mechanism(requested.into()),
+                    ),
+                )?,
+            )
+            .await?;
+        let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, 1)
+            .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
+
+        assert_eq!(
+            ErrorCode::UnsupportedSaslMechanism,
+            ErrorCode::try_from(response.error_code)?
+        );
+        assert_eq!(
+            Some(&["SCRAM-SHA-512".to_string(), "SCRAM-SHA-256".to_string()][..]),
+            response.mechanisms.as_deref(),
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn not_authenticated() -> Result<()> {
     let _guard = init_tracing()?;
 
