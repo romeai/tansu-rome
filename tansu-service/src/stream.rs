@@ -310,6 +310,21 @@ impl<L, T> AdmittedReply<L, T> {
     }
 }
 
+impl<L, T> AdmittedReply<L, T>
+where
+    L: AdmissionLease,
+{
+    /// Adjust the reservation owned by this reply without exposing its guard.
+    ///
+    /// Request handling may release a large decoded payload before the much
+    /// smaller response is written. Reconciling the same lease at that phase
+    /// boundary keeps accounting precise while the transport still owns the
+    /// proof, and does not permit callers to replace or extract the guard.
+    pub fn adjust_lease(&mut self, adjustment: L::Adjustment) -> Result<(), L::Error> {
+        self.lease.adjust(adjustment)
+    }
+}
+
 /// Failure of the request-admitted TCP runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestAdmissionError<P, S>
@@ -1834,6 +1849,12 @@ mod tests {
         reservation: Arc<ReservationEvidence>,
     }
 
+    #[derive(Debug)]
+    struct PhaseLease {
+        identity: Arc<()>,
+        reservation: usize,
+    }
+
     impl AdmissionLease for AdjustableLease {
         type Adjustment = usize;
         type Error = std::convert::Infallible;
@@ -1858,6 +1879,16 @@ mod tests {
 
         fn evidence(&self) -> &Self::Evidence {
             &self.reservation
+        }
+    }
+
+    impl AdmissionLease for PhaseLease {
+        type Adjustment = usize;
+        type Error = std::convert::Infallible;
+
+        fn adjust(&mut self, adjustment: Self::Adjustment) -> Result<(), Self::Error> {
+            self.reservation = adjustment;
+            Ok(())
         }
     }
 
@@ -2510,6 +2541,36 @@ mod tests {
         assert_eq!(91, evidence.identity);
         assert_eq!(expected_evidence, ptr::from_ref(evidence));
         assert_eq!(ptr::from_ref(frame.evidence()), ptr::from_ref(evidence));
+    }
+
+    #[test]
+    fn admitted_reply_reconciles_the_same_lease_after_request_payload_drop() {
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let identity = Arc::new(());
+        let expected_identity = Arc::as_ptr(&identity);
+        let frame = AdmittedFrame {
+            head: RequestHead {
+                body_len: 8,
+                api_key: 3,
+                api_version: 1,
+                correlation_id: 42,
+            },
+            payload: DropProbe(payload_drops.clone()),
+            lease: PhaseLease {
+                identity: identity.clone(),
+                reservation: 1_024,
+            },
+        };
+
+        let mut reply = frame.reply(Reply::NoResponse);
+        assert_eq!(1, payload_drops.load(Ordering::SeqCst));
+        reply.adjust_lease(128).unwrap();
+
+        // This destructuring is the private hand-off used by the transport.
+        // The stable token proves adjustment did not substitute the lease.
+        let AdmittedReply { lease, .. } = reply;
+        assert_eq!(expected_identity, Arc::as_ptr(&lease.identity));
+        assert_eq!(128, lease.reservation);
     }
 
     #[tokio::test]
