@@ -52,6 +52,12 @@ static SCRAM_SHA256_MECHANISM: &[Mechanism] = &[SCRAM_SHA256];
 /// The verified rsasl registry for callers that intentionally offer only SCRAM-SHA-512.
 static SCRAM_SHA512_MECHANISM: &[Mechanism] = &[SCRAM_SHA512];
 
+/// Kafka's default maximum server-side SASL token size is 512 KiB.
+const DEFAULT_MAXIMUM_SASL_TOKEN_SIZE: usize = 512 * 1024;
+
+/// Four maximum-sized tokens allow a complete SCRAM exchange while bounding cumulative work.
+const DEFAULT_MAXIMUM_SASL_TRANSCRIPT_SIZE: usize = 4 * DEFAULT_MAXIMUM_SASL_TOKEN_SIZE;
+
 fn is_verified_mechanism(mechanism: &str) -> bool {
     VERIFIED_MECHANISMS
         .iter()
@@ -65,6 +71,59 @@ pub enum Error {
     SansIo(#[from] tansu_sans_io::Error),
     Sasl(Arc<SASLError>),
     SaslSession(Arc<SessionError>),
+}
+
+/// Invalid bounds for a SASL exchange.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SaslLimitsError {
+    #[error("maximum SASL token size must be greater than zero")]
+    ZeroTokenSize,
+    #[error("maximum SASL transcript size must be greater than zero")]
+    ZeroTranscriptSize,
+}
+
+/// Per-connection bounds applied to caller-supplied SASL configurations.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SaslLimits {
+    maximum_token_size: usize,
+    maximum_transcript_size: usize,
+}
+
+impl SaslLimits {
+    pub fn new(
+        maximum_token_size: usize,
+        maximum_transcript_size: usize,
+    ) -> Result<Self, SaslLimitsError> {
+        if maximum_token_size == 0 {
+            return Err(SaslLimitsError::ZeroTokenSize);
+        }
+
+        if maximum_transcript_size == 0 {
+            return Err(SaslLimitsError::ZeroTranscriptSize);
+        }
+
+        Ok(Self {
+            maximum_token_size,
+            maximum_transcript_size,
+        })
+    }
+
+    pub fn maximum_token_size(self) -> usize {
+        self.maximum_token_size
+    }
+
+    pub fn maximum_transcript_size(self) -> usize {
+        self.maximum_transcript_size
+    }
+}
+
+impl Default for SaslLimits {
+    fn default() -> Self {
+        Self {
+            maximum_token_size: DEFAULT_MAXIMUM_SASL_TOKEN_SIZE,
+            maximum_transcript_size: DEFAULT_MAXIMUM_SASL_TRANSCRIPT_SIZE,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -100,13 +159,36 @@ impl From<SessionError> for Error {
 #[derive(Clone)]
 pub struct Authentication {
     config: Arc<SASLConfig>,
+    limits: SaslLimits,
     stage: Arc<Mutex<Option<Stage>>>,
 }
 
 pub enum Stage {
     Server(SASLServer<Justification>),
-    Session(Session<Justification>),
+    Session(SaslSession),
     Finished(Result<Success, AuthError>),
+}
+
+pub struct SaslSession {
+    session: Session<Justification>,
+    transcript_size: usize,
+}
+
+impl SaslSession {
+    fn new(session: Session<Justification>) -> Self {
+        Self {
+            session,
+            transcript_size: 0,
+        }
+    }
+}
+
+impl Debug for SaslSession {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(SaslSession))
+            .field("transcript_size", &self.transcript_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Debug for Stage {
@@ -117,9 +199,14 @@ impl Debug for Stage {
 
 impl Authentication {
     pub fn server(config: Arc<SASLConfig>) -> Self {
+        Self::server_with_limits(config, SaslLimits::default())
+    }
+
+    pub fn server_with_limits(config: Arc<SASLConfig>, limits: SaslLimits) -> Self {
         let server = SASLServer::<Justification>::new(config.clone());
         Self {
             config,
+            limits,
             stage: Arc::new(Mutex::new(Some(Stage::Server(server)))),
         }
     }
@@ -156,6 +243,8 @@ pub enum AuthError {
     MissingValidation,
     MissingProperty { mechanism: String, property: String },
     NoSuchUser,
+    TokenTooLarge { length: usize, maximum: usize },
+    TranscriptTooLarge { length: usize, maximum: usize },
     UnknownMechanism(String),
 }
 
@@ -368,6 +457,15 @@ mod tests {
         is_sync::<Authentication>();
     }
 
+    #[test]
+    fn sasl_limits_reject_zero_bounds() {
+        assert_eq!(Err(SaslLimitsError::ZeroTokenSize), SaslLimits::new(0, 1),);
+        assert_eq!(
+            Err(SaslLimitsError::ZeroTranscriptSize),
+            SaslLimits::new(1, 0),
+        );
+    }
+
     #[tokio::test]
     async fn caller_supplied_scram_configuration_authenticates_without_storage() {
         let config = configuration_with_callback_for(StaticScramCallback, ScramMechanism::Scram256)
@@ -439,7 +537,7 @@ mod tests {
             let session = server
                 .start_suggested(PLAIN.mechanism)
                 .expect("test config explicitly enables PLAIN");
-            _ = guard.replace(Stage::Session(session));
+            _ = guard.replace(Stage::Session(SaslSession::new(session)));
         }
 
         let mut context = RamaContext::default();
@@ -466,6 +564,104 @@ mod tests {
                 .as_ref(),
             Some(Stage::Finished(Err(AuthError::UnknownMechanism(mechanism))))
                 if mechanism == "PLAIN"
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_sasl_token_is_rejected_before_session_processing() {
+        let config = SASLConfig::builder()
+            .with_registry(Registry::with_mechanisms(PLAIN_MECHANISMS))
+            .with_callback(PlainCallback)
+            .expect("PLAIN-capable test config");
+        let authentication = Authentication::server_with_limits(
+            config,
+            SaslLimits::new(4, 16).expect("valid bounds"),
+        );
+
+        {
+            let mut guard = authentication.stage.lock().expect("authentication stage");
+            let Some(Stage::Server(server)) = guard.take() else {
+                panic!("authentication must start with a SASL server")
+            };
+            let session = server
+                .start_suggested(PLAIN.mechanism)
+                .expect("test config explicitly enables PLAIN");
+            _ = guard.replace(Stage::Session(SaslSession::new(session)));
+        }
+
+        let mut context = RamaContext::default();
+        assert!(context.insert(authentication.clone()).is_none());
+        let response = SaslAuthenticateService::default()
+            .serve(
+                context,
+                SaslAuthenticateRequest::default().auth_bytes(Bytes::from_static(b"12345")),
+            )
+            .await
+            .expect("SASL authenticate response");
+
+        assert_eq!(
+            ErrorCode::SaslAuthenticationFailed,
+            ErrorCode::try_from(response.error_code).expect("known Kafka error code"),
+        );
+        assert!(matches!(
+            authentication
+                .stage
+                .lock()
+                .expect("authentication stage")
+                .as_ref(),
+            Some(Stage::Finished(Err(AuthError::TokenTooLarge {
+                length: 5,
+                maximum: 4,
+            })))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_sasl_transcript_is_rejected_before_session_processing() {
+        let config = SASLConfig::builder()
+            .with_registry(Registry::with_mechanisms(PLAIN_MECHANISMS))
+            .with_callback(PlainCallback)
+            .expect("PLAIN-capable test config");
+        let authentication = Authentication::server_with_limits(
+            config,
+            SaslLimits::new(8, 4).expect("valid bounds"),
+        );
+
+        {
+            let mut guard = authentication.stage.lock().expect("authentication stage");
+            let Some(Stage::Server(server)) = guard.take() else {
+                panic!("authentication must start with a SASL server")
+            };
+            let session = server
+                .start_suggested(PLAIN.mechanism)
+                .expect("test config explicitly enables PLAIN");
+            _ = guard.replace(Stage::Session(SaslSession::new(session)));
+        }
+
+        let mut context = RamaContext::default();
+        assert!(context.insert(authentication.clone()).is_none());
+        let response = SaslAuthenticateService::default()
+            .serve(
+                context,
+                SaslAuthenticateRequest::default().auth_bytes(Bytes::from_static(b"12345")),
+            )
+            .await
+            .expect("SASL authenticate response");
+
+        assert_eq!(
+            ErrorCode::SaslAuthenticationFailed,
+            ErrorCode::try_from(response.error_code).expect("known Kafka error code"),
+        );
+        assert!(matches!(
+            authentication
+                .stage
+                .lock()
+                .expect("authentication stage")
+                .as_ref(),
+            Some(Stage::Finished(Err(AuthError::TranscriptTooLarge {
+                length: 5,
+                maximum: 4,
+            })))
         ));
     }
 }

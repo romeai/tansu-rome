@@ -794,11 +794,11 @@ where
 
     #[instrument(skip_all)]
     async fn serve(&self, ctx: Context<State>, req: Bytes) -> Result<Self::Response, Self::Error> {
-        debug!(req = ?&req[..]);
+        debug!(request_length = req.len());
         self.inner
             .serve(ctx, req)
             .await
-            .inspect(|response| debug!(response = ?&response[..]))
+            .inspect(|response| debug!(response_length = response.len()))
     }
 }
 
