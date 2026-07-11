@@ -85,7 +85,7 @@ pub struct Authentication {
 pub enum Stage {
     Server(SASLServer<Justification>),
     Session(Session<Justification>),
-    Finished(Option<Success>),
+    Finished(Result<Success, AuthError>),
 }
 
 impl Debug for Stage {
@@ -106,7 +106,7 @@ impl Authentication {
     pub fn is_authenticated(&self) -> bool {
         self.stage
             .lock()
-            .map(|guard| matches!(guard.as_ref(), Some(Stage::Finished(_))))
+            .map(|guard| matches!(guard.as_ref(), Some(Stage::Finished(Ok(_)))))
             .ok()
             .unwrap_or_default()
     }
@@ -132,6 +132,7 @@ impl Debug for Authentication {
 pub enum AuthError {
     Bad,
     Io(tansu_sans_io::Error),
+    MissingValidation,
     MissingProperty { mechanism: String, property: String },
     NoSuchUser,
     UnknownMechanism(String),
