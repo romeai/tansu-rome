@@ -17,8 +17,8 @@ use std::sync::Arc;
 use rama::Layer;
 use rsasl::config::SASLConfig;
 use tansu_service::{
-    BytesFrameLayer, BytesFrameService, FrameRouteService, TcpBytesLayer, TcpBytesService,
-    TcpContext, TcpContextLayer, TcpContextService,
+    AdmittedRouteBuilder, BytesFrameLayer, BytesFrameService, FrameRouteBuilder, FrameRouteService,
+    TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
 };
 use tansu_storage::Storage;
 use tracing::debug;
@@ -32,6 +32,74 @@ pub mod storage;
 type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<(), Error>>, ()>>;
 
+/// Build the immutable Kafka API route table shared by all connections.
+pub fn routes<C, S>(coordinator: C, storage: S) -> Result<FrameRouteService<(), Error>, Error>
+where
+    S: Storage + Clone,
+    C: Coordinator,
+{
+    route_builder(coordinator, storage).and_then(|builder| builder.build().map_err(Into::into))
+}
+
+/// Compose Tansu's complete standard storage, coordinator, and auth surface.
+///
+/// Keeping the unbuilt form lets an embedding select admitted representations
+/// without reproducing the broker's API list.
+pub fn route_builder<C, S>(
+    coordinator: C,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+    C: Coordinator,
+{
+    storage::services(FrameRouteService::<(), Error>::builder(), storage)
+        .inspect(|builder| debug!(?builder))
+        .and_then(|builder| {
+            coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
+        })
+        .and_then(auth::services)
+}
+
+/// Compose the standard surface for admission before owned request decoding.
+pub fn admitted_route_builder<C, S, L>(
+    coordinator: C,
+    storage: S,
+    decode_limits: tansu_sans_io::DecodeLimits,
+) -> Result<AdmittedRouteBuilder<(), Error, L>, Error>
+where
+    S: Storage + Clone,
+    C: Coordinator,
+    L: Send + 'static,
+{
+    route_builder(coordinator, storage)?
+        .into_admitted_with_limits(decode_limits)
+        .map_err(Into::into)
+}
+
+/// Add connection-local protocol state and TCP framing to a shared route table.
+pub fn connection_service(
+    cluster_id: &str,
+    route: FrameRouteService<(), Error>,
+    sasl_config: Option<Arc<SASLConfig>>,
+    maximum_frame_size: usize,
+) -> TcpRouteFrame {
+    (
+        TcpContextLayer::new(
+            TcpContext::default()
+                .cluster_id(Some(cluster_id.into()))
+                .maximum_frame_size(Some(maximum_frame_size)),
+        ),
+        TcpBytesLayer::default(),
+        BytesFrameLayer::default().with_sasl_config(sasl_config),
+    )
+        .into_layer(route)
+}
+
+/// Build a route table and a single connection service.
+///
+/// The broker uses [`routes`] and [`connection_service`] separately so route
+/// construction occurs once rather than once per accepted socket.
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
@@ -65,23 +133,6 @@ where
     S: Storage + Clone,
     C: Coordinator,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
-        .inspect(|builder| debug!(?builder))
-        .and_then(|builder| {
-            coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
-        })
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|route| {
-            (
-                TcpContextLayer::new(
-                    TcpContext::default()
-                        .cluster_id(Some(cluster_id.into()))
-                        .maximum_frame_size(Some(maximum_frame_size)),
-                ),
-                TcpBytesLayer::default(),
-                BytesFrameLayer::default().with_sasl_config(sasl_config),
-            )
-                .into_layer(route)
-        })
+    routes(coordinator, storage)
+        .map(|route| connection_service(cluster_id, route, sasl_config, maximum_frame_size))
 }

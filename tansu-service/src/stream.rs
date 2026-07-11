@@ -52,7 +52,7 @@ const FRAME_LENGTH_PREFIX_BYTES: usize = size_of::<i32>();
 const MINIMUM_REQUEST_BODY_BYTES: usize = size_of::<i16>() * 2 + size_of::<i32>();
 
 /// Bytes in the length prefix and fixed Kafka request header fields.
-const REQUEST_HEAD_BYTES: usize = FRAME_LENGTH_PREFIX_BYTES + MINIMUM_REQUEST_BODY_BYTES;
+pub(crate) const REQUEST_HEAD_BYTES: usize = FRAME_LENGTH_PREFIX_BYTES + MINIMUM_REQUEST_BODY_BYTES;
 
 /// Minimum Kafka response body: correlation ID.
 const MINIMUM_RESPONSE_BODY_BYTES: usize = size_of::<i32>();
@@ -62,7 +62,7 @@ const MINIMUM_RESPONSE_BODY_BYTES: usize = size_of::<i32>();
 const MAXIMUM_SOCKET_BUFFER_BYTES: usize = i32::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FrameLength {
+pub(crate) struct FrameLength {
     declared: i32,
     body: usize,
     complete: usize,
@@ -486,7 +486,7 @@ impl std::fmt::Display for ProtocolIoPhase {
 }
 
 impl RequestHead {
-    fn decode(
+    pub(crate) fn decode(
         encoded: [u8; REQUEST_HEAD_BYTES],
         maximum_frame_size: Option<usize>,
     ) -> Result<(Self, FrameLength), Error> {
@@ -1947,7 +1947,9 @@ where
         W: AsyncWriteExt + Unpin,
     {
         let write = async {
-            req.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+            req.write_all(&frame)
+                .await
+                .inspect_err(|err| error!(?err))?;
             req.flush().await
         };
         let result: io::Result<()> = if let Some(timeout) = timeout {

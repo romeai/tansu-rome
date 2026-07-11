@@ -214,7 +214,7 @@ where
 /// A [`Frame`] route builder providing an [`ApiVersionsResponse`] for all available routes
 #[derive(Debug)]
 pub struct FrameRouteBuilder<State, E> {
-    routes: BTreeMap<i16, BoxService<State, Frame, Frame, E>>,
+    pub(crate) routes: BTreeMap<i16, BoxService<State, Frame, Frame, E>>,
 }
 
 impl<State, E> FrameRouteBuilder<State, E>
@@ -226,6 +226,32 @@ where
         Self {
             routes: BTreeMap::new(),
         }
+    }
+
+    /// Convert the typed-frame routes into the admitted byte-route builder.
+    ///
+    /// The standard Tansu services retain their owned request models, while
+    /// embedders may replace an individual route with a raw admitted service
+    /// before the final registry is built.
+    pub fn into_admitted<L>(self) -> Result<crate::AdmittedRouteBuilder<State, E, L>, Error>
+    where
+        L: Send + 'static,
+        E: From<tokio::task::JoinError>,
+    {
+        self.into_admitted_with_limits(tansu_sans_io::DecodeLimits::default())
+    }
+
+    /// Convert the typed-frame routes with explicit generated-decode bounds.
+    pub fn into_admitted_with_limits<L>(
+        self,
+        decode_limits: tansu_sans_io::DecodeLimits,
+    ) -> Result<crate::AdmittedRouteBuilder<State, E, L>, Error>
+    where
+        L: Send + 'static,
+        E: From<tokio::task::JoinError>,
+    {
+        let builder = self.with_derived_api_versions()?;
+        crate::AdmittedRouteBuilder::from_owned_routes(builder.routes, decode_limits)
     }
 
     pub fn with_service<S>(self, service: S) -> Result<Self, Error>
@@ -246,20 +272,28 @@ where
     }
 
     pub fn build(self) -> Result<FrameRouteService<State, E>, Error> {
+        self.with_derived_api_versions()
+            .map(|builder| FrameRouteService {
+                routes: Arc::new(builder.routes),
+            })
+    }
+
+    /// Add the discovery route while finalizing a callable route registry.
+    ///
+    /// Keeping this step private ensures every finalization path derives
+    /// discovery exactly once from the same routes it makes callable.
+    fn with_derived_api_versions(self) -> Result<Self, Error> {
         let api_key = ApiVersionsRequest::KEY;
         let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
         supported.push(api_key);
 
         self.with_route(
-            api_key,
+            ApiVersionsRequest::KEY,
             ApiVersionsService {
                 supported,
                 error: PhantomData,
             }
             .boxed(),
         )
-        .map(|builder| FrameRouteService {
-            routes: Arc::new(builder.routes),
-        })
     }
 }

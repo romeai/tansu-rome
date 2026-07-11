@@ -252,6 +252,7 @@ mod api;
 mod channel;
 mod consumer;
 mod frame;
+mod route;
 mod stream;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
@@ -267,6 +268,11 @@ pub use frame::{
     BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
     FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameService, RequestApiKeyMatcher,
     RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
+};
+pub use route::{
+    AdmittedConnectionRouteService, AdmittedRouteBuilder, AdmittedRouteService,
+    RequestDecodeLimits, RouteAdmissionClass, RouteAuthentication, RouteDecodeStrategy,
+    RouteMetadata, RouteSession,
 };
 
 pub use stream::{
@@ -313,6 +319,13 @@ pub enum Error {
     Parse(#[from] url::ParseError),
     Protocol(#[from] tansu_sans_io::Error),
     UnableToSend(Box<Frame>),
+    UnknownRouteApiKey(i16),
+    UnsupportedRouteVersion {
+        api_key: i16,
+        api_version: i16,
+        minimum: i16,
+        maximum: i16,
+    },
     UnknownHost(Url),
     UnknownServiceBody(Box<Body>),
     UnknownServiceFrame(Box<Frame>),
