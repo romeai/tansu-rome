@@ -31,7 +31,7 @@ use tansu_sans_io::{
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS, AdmittedFrame, AdmittedReply};
+use crate::{API_ERRORS, API_REQUESTS, AdmittedFrame, AdmittedReply, Reply};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -289,6 +289,10 @@ impl<S> BytesFrameService<S> {
     }
 }
 
+fn no_response_required(frame: &Frame) -> bool {
+    matches!(&frame.body, Body::ProduceRequest(request) if request.acks == 0)
+}
+
 impl<S, State> Service<State, Bytes> for BytesFrameService<S>
 where
     S: Service<State, Frame, Response = Frame>,
@@ -429,12 +433,12 @@ where
 
 impl<S, State, L> Service<State, AdmittedFrame<L, Bytes>> for BytesFrameService<S>
 where
-    S: Service<State, AdmittedFrame<L, Frame>, Response = AdmittedReply<L, Frame>>,
+    S: Service<State, Frame, Response = Frame>,
     State: Clone + Send + Sync + 'static,
     L: Send + 'static,
     S::Error: From<tansu_sans_io::Error> + From<tokio::task::JoinError> + Debug,
 {
-    type Response = AdmittedReply<L, Bytes>;
+    type Response = AdmittedReply<L, Reply>;
     type Error = S::Error;
 
     #[instrument(skip(ctx, req))]
@@ -505,17 +509,23 @@ where
             assert!(ctx.insert(authentication).is_none());
         }
 
-        let request = req.map_payload(|_| frame);
-        let response = self
-            .inner
-            .serve(ctx, request)
-            .await
-            .inspect(|response| debug!(?response.payload))?;
-        let AdmittedReply {
-            head,
-            payload: Frame { body, .. },
-            lease,
-        } = response;
+        let no_response = no_response_required(&frame);
+        let AdmittedFrame { head, lease, .. } = req;
+        let response = self.inner.serve(ctx, frame).await;
+
+        if no_response {
+            match response {
+                Ok(response) => debug!(?response, "acks=0 handler completed"),
+                Err(error) => error!(?error, "acks=0 handler failed without a response"),
+            }
+            return Ok(AdmittedReply {
+                head,
+                payload: Reply::NoResponse,
+                lease,
+            });
+        }
+
+        let Frame { body, .. } = response.inspect(|response| debug!(?response))?;
 
         let payload = if sasl_handshake_v0 {
             if let Some(af) = self.af.as_ref()
@@ -567,7 +577,7 @@ where
 
         Ok(AdmittedReply {
             head,
-            payload,
+            payload: Reply::Frame(payload),
             lease,
         })
     }
@@ -892,11 +902,79 @@ impl<F> ResponseService<F> {
 
 #[cfg(test)]
 mod tests {
-    use rama::Layer as _;
+    use rama::{Context, Layer as _, Service as _};
     use rsasl::config::SASLConfig;
     use tansu_auth::SaslLimits;
+    use tansu_sans_io::{
+        ApiKey as _, Body, Frame, Header, ProduceRequest, ProduceResponse,
+        produce_response::TopicProduceResponse,
+    };
 
-    use super::{BytesFrameLayer, BytesFrameService};
+    use super::{BytesFrameLayer, BytesFrameService, no_response_required};
+    use crate::{AdmittedFrame, Error, Reply, RequestHead};
+
+    #[derive(Clone, Debug)]
+    struct ProduceService {
+        fail: bool,
+    }
+
+    impl rama::Service<(), Frame> for ProduceService {
+        type Response = Frame;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            req: Frame,
+        ) -> Result<Self::Response, Self::Error> {
+            if self.fail {
+                return Err(Error::Message("produce failed".into()));
+            }
+
+            Ok(Frame {
+                size: 0,
+                header: Header::Response {
+                    correlation_id: req.correlation_id()?,
+                },
+                body: Body::ProduceResponse(
+                    ProduceResponse::default()
+                        .responses(Some(Vec::<TopicProduceResponse>::new()))
+                        .throttle_time_ms(Some(0)),
+                ),
+            })
+        }
+    }
+
+    fn admitted_produce(acks: i16) -> AdmittedFrame<()> {
+        let api_version = 3;
+        let correlation_id = 47;
+        let payload = Frame::request(
+            Header::Request {
+                api_key: ProduceRequest::KEY,
+                api_version,
+                correlation_id,
+                client_id: Some("test".into()),
+            },
+            Body::ProduceRequest(
+                ProduceRequest::default()
+                    .acks(acks)
+                    .timeout_ms(1_000)
+                    .topic_data(Some(Vec::new())),
+            ),
+        )
+        .unwrap();
+
+        AdmittedFrame {
+            head: RequestHead {
+                body_len: payload.len() - 4,
+                api_key: ProduceRequest::KEY,
+                api_version,
+                correlation_id,
+            },
+            payload,
+            lease: (),
+        }
+    }
 
     #[test]
     fn bytes_frame_layer_creates_fresh_authentication_per_service() {
@@ -929,5 +1007,49 @@ mod tests {
         assert!(debug.contains("sasl_configured: true"));
         assert!(!debug.contains("debug-principal"));
         assert!(!debug.contains("debug-password"));
+    }
+
+    #[tokio::test]
+    async fn produce_acks_zero_never_returns_a_frame() {
+        for fail in [false, true] {
+            let service = BytesFrameLayer::default().into_layer(ProduceService { fail });
+            let response = service
+                .serve(Context::default(), admitted_produce(0))
+                .await
+                .unwrap();
+            assert_eq!(&Reply::NoResponse, response.payload());
+        }
+    }
+
+    #[tokio::test]
+    async fn nonzero_produce_acknowledgements_return_a_frame_and_errors() {
+        let service = BytesFrameLayer::default().into_layer(ProduceService { fail: false });
+        let response = service
+            .serve(Context::default(), admitted_produce(1))
+            .await
+            .unwrap();
+        assert!(matches!(response.payload(), Reply::Frame(frame) if !frame.is_empty()));
+
+        let service = BytesFrameLayer::default().into_layer(ProduceService { fail: true });
+        assert!(matches!(
+            service.serve(Context::default(), admitted_produce(-1)).await,
+            Err(Error::Message(message)) if message == "produce failed"
+        ));
+    }
+
+    #[test]
+    fn only_decoded_produce_acks_zero_selects_no_response() {
+        let non_produce = Frame {
+            size: 0,
+            header: Header::Request {
+                api_key: tansu_sans_io::ApiVersionsRequest::KEY,
+                api_version: 4,
+                correlation_id: 1,
+                client_id: None,
+            },
+            body: Body::ApiVersionsRequest(tansu_sans_io::ApiVersionsRequest::default()),
+        };
+
+        assert!(!no_response_required(&non_produce));
     }
 }
