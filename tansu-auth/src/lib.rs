@@ -15,9 +15,9 @@
 use rsasl::{
     callback::{Context, Request, SessionCallback, SessionData},
     config::SASLConfig,
-    mechanisms::scram::properties::ScramStoredPassword,
-    prelude::{SASLError, SASLServer, Session, SessionError, Validation},
-    property::{AuthId, AuthzId, Password},
+    mechanisms::scram::{SCRAM_SHA256, SCRAM_SHA512, properties::ScramStoredPassword},
+    prelude::{Mechanism, Registry, SASLError, SASLServer, Session, SessionError, Validation},
+    property::{AuthId, AuthzId},
     validate::{Validate, ValidationError},
 };
 use std::{
@@ -36,6 +36,15 @@ mod handshake;
 
 pub use authenticate::SaslAuthenticateService;
 pub use handshake::SaslHandshakeService;
+
+/// SASL mechanisms whose credentials Tansu verifies before granting an identity.
+static VERIFIED_MECHANISMS: &[Mechanism] = &[SCRAM_SHA512, SCRAM_SHA256];
+
+fn is_verified_mechanism(mechanism: &str) -> bool {
+    VERIFIED_MECHANISMS
+        .iter()
+        .any(|verified| verified.mechanism.as_str() == mechanism)
+}
 
 #[derive(Clone, Debug, Error)]
 pub enum Error {
@@ -171,66 +180,48 @@ where
     {
         Self { storage }
     }
+}
 
-    #[instrument(skip_all)]
-    fn check(
-        &self,
-        session_data: &SessionData,
-        context: &Context<'_>,
-    ) -> Result<Result<Success, AuthError>, Error> {
-        debug!(mechanism = %session_data.mechanism().mechanism);
+#[instrument(skip_all)]
+fn check_identity(
+    session_data: &SessionData,
+    context: &Context<'_>,
+) -> Result<Result<Success, AuthError>, Error> {
+    debug!(mechanism = %session_data.mechanism().mechanism);
 
-        if session_data.mechanism().mechanism == "PLAIN" {
-            Ok(context
-                .get_ref::<Password>()
-                .ok_or(AuthError::MissingProperty {
-                    mechanism: session_data.mechanism().mechanism.to_string(),
-                    property: "Password".into(),
-                })
-                .and(
-                    context
-                        .get_ref::<AuthId>()
-                        .inspect(|auth_id| {
-                            debug!(mechanism = %session_data.mechanism().mechanism, auth_id)
-                        })
-                        .ok_or(AuthError::MissingProperty {
-                            mechanism: session_data.mechanism().mechanism.to_string(),
-                            property: "AuthId".into(),
-                        }).map(ToString::to_string).map(|auth_id| {
-                            Success { auth_id }
-                        })
-                ))
-        } else if session_data.mechanism().mechanism.starts_with("SCRAM-") {
-            Ok(context
-                .get_ref::<AuthId>()
-                .inspect(|auth_id| debug!(mechanism = %session_data.mechanism().mechanism, auth_id))
-                .ok_or(AuthError::MissingProperty {
-                    mechanism: session_data.mechanism().mechanism.to_string(),
-                    property: "AuthId".into(),
-                })
-                .and_then(|auth_id| {
-                    context
-                        .get_ref::<AuthzId>()
-                        .inspect(|authz_id| {
-                            debug!(mechanism = %session_data.mechanism().mechanism, authz_id)
-                        })
-                        .map_or(Ok(Success{
-                            auth_id:auth_id.to_string()
-                        }), |authz_id| {
+    if is_verified_mechanism(session_data.mechanism().mechanism.as_str()) {
+        Ok(context
+            .get_ref::<AuthId>()
+            .inspect(|auth_id| debug!(mechanism = %session_data.mechanism().mechanism, auth_id))
+            .ok_or(AuthError::MissingProperty {
+                mechanism: session_data.mechanism().mechanism.to_string(),
+                property: "AuthId".into(),
+            })
+            .and_then(|auth_id| {
+                context
+                    .get_ref::<AuthzId>()
+                    .inspect(|authz_id| {
+                        debug!(mechanism = %session_data.mechanism().mechanism, authz_id)
+                    })
+                    .map_or(
+                        Ok(Success {
+                            auth_id: auth_id.to_string(),
+                        }),
+                        |authz_id| {
                             if authz_id == auth_id {
-                                Ok(Success{
-                                    auth_id:auth_id.to_string()
+                                Ok(Success {
+                                    auth_id: auth_id.to_string(),
                                 })
                             } else {
                                 Err(AuthError::Bad)
                             }
-                        })
-                }))
-        } else {
-            Ok(Err(AuthError::UnknownMechanism(
-                session_data.mechanism().mechanism.to_string(),
-            )))
-        }
+                        },
+                    )
+            }))
+    } else {
+        Ok(Err(AuthError::UnknownMechanism(
+            session_data.mechanism().mechanism.to_string(),
+        )))
     }
 }
 
@@ -293,8 +284,7 @@ where
         debug!(?session_data);
 
         _ = validate.with::<Justification, _>(|| {
-            self.check(session_data, context)
-                .map_err(|e| ValidationError::Boxed(Box::new(e)))
+            check_identity(session_data, context).map_err(|e| ValidationError::Boxed(Box::new(e)))
         })?;
 
         Ok(())
@@ -306,7 +296,7 @@ where
     S: Storage,
 {
     SASLConfig::builder()
-        .with_defaults()
+        .with_registry(Registry::with_mechanisms(VERIFIED_MECHANISMS))
         .with_callback(Callback::new(storage))
         .map_err(Into::into)
 }
@@ -314,6 +304,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use rama::{Context as RamaContext, Service as _};
+    use rsasl::{
+        mechanisms::plain::PLAIN,
+        prelude::{Mechanism, Registry},
+    };
+    use tansu_sans_io::{ErrorCode, SaslAuthenticateRequest};
+
+    /// Test registry simulating a downstream feature-unified PLAIN configuration.
+    static PLAIN_MECHANISMS: &[Mechanism] = &[PLAIN];
+
+    #[derive(Clone, Copy, Debug)]
+    struct PlainCallback;
+
+    impl SessionCallback for PlainCallback {
+        fn validate(
+            &self,
+            session_data: &SessionData,
+            context: &Context<'_>,
+            validate: &mut Validate<'_>,
+        ) -> Result<(), ValidationError> {
+            _ = validate.with::<Justification, _>(|| {
+                check_identity(session_data, context)
+                    .map_err(|error| ValidationError::Boxed(Box::new(error)))
+            })?;
+
+            Ok(())
+        }
+    }
 
     fn is_send<T: Send>() {}
     fn is_sync<T: Sync>() {}
@@ -322,5 +341,51 @@ mod tests {
     fn authentication() {
         is_send::<Authentication>();
         is_sync::<Authentication>();
+    }
+
+    #[tokio::test]
+    async fn plain_capable_config_cannot_authenticate() {
+        let config = SASLConfig::builder()
+            .with_registry(Registry::with_mechanisms(PLAIN_MECHANISMS))
+            .with_callback(PlainCallback)
+            .expect("PLAIN-capable test config");
+        let authentication = Authentication::server(config);
+
+        {
+            let mut guard = authentication.stage.lock().expect("authentication stage");
+            let Some(Stage::Server(server)) = guard.take() else {
+                panic!("authentication must start with a SASL server")
+            };
+            let session = server
+                .start_suggested(PLAIN.mechanism)
+                .expect("test config explicitly enables PLAIN");
+            _ = guard.replace(Stage::Session(session));
+        }
+
+        let mut context = RamaContext::default();
+        assert!(context.insert(authentication.clone()).is_none());
+        let response = SaslAuthenticateService::default()
+            .serve(
+                context,
+                SaslAuthenticateRequest::default()
+                    .auth_bytes(Bytes::from_static(b"\0alice\0anything")),
+            )
+            .await
+            .expect("SASL authenticate response");
+
+        assert_eq!(
+            ErrorCode::SaslAuthenticationFailed,
+            ErrorCode::try_from(response.error_code).expect("known Kafka error code"),
+        );
+        assert!(!authentication.is_authenticated());
+        assert!(matches!(
+            authentication
+                .stage
+                .lock()
+                .expect("authentication stage")
+                .as_ref(),
+            Some(Stage::Finished(Err(AuthError::UnknownMechanism(mechanism))))
+                if mechanism == "PLAIN"
+        ));
     }
 }

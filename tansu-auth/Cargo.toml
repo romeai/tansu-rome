@@ -20,5 +20,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+rsasl = { workspace = true, features = ["plain"] }
+
 [lints]
 workspace = true
