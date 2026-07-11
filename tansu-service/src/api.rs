@@ -20,7 +20,7 @@ use tansu_sans_io::{
     RootMessageMeta, api_versions_response::ApiVersion,
 };
 
-use crate::Error;
+use crate::{AdmittedFrame, AdmittedReply, Error};
 
 /// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from [`RootMessageMeta`].
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -173,6 +173,41 @@ where
         } else {
             Err(E::from(Error::UnknownServiceFrame(Box::new(req))))
         }
+    }
+}
+
+impl<State, E, L> Service<State, AdmittedFrame<L, Frame>> for FrameRouteService<State, E>
+where
+    State: Clone + Send + Sync + 'static,
+    E: std::error::Error + From<tansu_sans_io::Error> + From<Error> + Send + Sync + 'static,
+    L: Send + 'static,
+{
+    type Response = AdmittedReply<L, Frame>;
+    type Error = E;
+
+    async fn serve(
+        &self,
+        ctx: Context<State>,
+        req: AdmittedFrame<L, Frame>,
+    ) -> Result<Self::Response, Self::Error> {
+        let api_key = req.payload.api_key()?;
+        let Some(service) = self.routes.get(&api_key) else {
+            return Err(E::from(Error::UnknownServiceFrame(Box::new(req.payload))));
+        };
+
+        let AdmittedFrame {
+            head,
+            payload,
+            lease,
+        } = req;
+        service
+            .serve(ctx, payload)
+            .await
+            .map(|payload| AdmittedReply {
+                head,
+                payload,
+                lease,
+            })
     }
 }
 
