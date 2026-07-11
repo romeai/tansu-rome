@@ -147,6 +147,7 @@
 //! # Ok(())
 //! # }
 //! ```
+pub mod borrowed;
 pub(crate) mod codec;
 pub mod deflated;
 pub mod header;
