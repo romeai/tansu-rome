@@ -16,7 +16,7 @@ use rama::{Context, Layer as _, Service as _};
 use tansu_sans_io::{ApiKey as _, Frame, Header, MetadataRequest, MetadataResponse};
 use tansu_service::{
     BytesFrameLayer, BytesTcpService, FrameBytesLayer, FrameService, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer,
+    TcpContextLayer, TcpListenerError, TcpListenerLayer,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -29,7 +29,10 @@ use crate::common::{Error, init_tracing};
 
 mod common;
 
-async fn server(cancellation: CancellationToken, listener: TcpListener) -> Result<(), Error> {
+async fn server(
+    cancellation: CancellationToken,
+    listener: TcpListener,
+) -> Result<(), TcpListenerError<std::convert::Infallible>> {
     let server = (
         TcpListenerLayer::new(cancellation),
         TcpContextLayer::default(),

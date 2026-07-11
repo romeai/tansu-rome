@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, io, marker::PhantomData, mem::size_of, net::SocketAddr, time::SystemTime};
+use std::{
+    error, fmt::Debug, io, marker::PhantomData, mem::size_of, net::SocketAddr, num::NonZeroUsize,
+    sync::Arc, time::SystemTime,
+};
 
 use bytes::Bytes;
 use nanoid::nanoid;
 use opentelemetry::KeyValue;
-use rama::{Context, Layer, Service};
+use rama::{
+    Context, Layer, Service,
+    layer::limit::policy::{Policy, PolicyOutput, PolicyResult, UnlimitedPolicy},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
+    sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -148,26 +155,125 @@ where
     }
 }
 
+/// The policy input emitted before the listener accepts its next connection.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct AcceptIntent;
+
+/// An error returned by the TCP listener runtime.
+#[derive(Debug, thiserror::Error)]
+pub enum TcpListenerError<E>
+where
+    E: error::Error + 'static,
+{
+    /// The listening socket failed.
+    #[error("TCP listener I/O failed")]
+    Io(#[from] io::Error),
+
+    /// The connection policy aborted an accept intent.
+    #[error("connection policy aborted accept intent")]
+    Policy(#[source] E),
+}
+
+/// A Rama limit policy with a fixed concurrent-connection limit.
+#[derive(Clone, Debug)]
+pub struct FixedConnectionPolicy {
+    permits: Arc<Semaphore>,
+}
+
+impl FixedConnectionPolicy {
+    /// Create a policy with `limit` concurrent connection guards.
+    pub fn new(limit: NonZeroUsize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit.get())),
+        }
+    }
+
+    /// Return the number of leases that can be acquired immediately.
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+}
+
+/// An owned lease for one admitted connection.
+#[derive(Debug)]
+pub struct FixedConnectionLease {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<State> Policy<State, AcceptIntent> for FixedConnectionPolicy
+where
+    State: Clone + Send + Sync + 'static,
+{
+    type Guard = FixedConnectionLease;
+    type Error = AcquireError;
+
+    async fn check(
+        &self,
+        ctx: Context<State>,
+        request: AcceptIntent,
+    ) -> PolicyResult<State, AcceptIntent, Self::Guard, Self::Error> {
+        match self.permits.clone().acquire_owned().await {
+            Ok(permit) => PolicyResult {
+                ctx,
+                request,
+                output: PolicyOutput::Ready(FixedConnectionLease { _permit: permit }),
+            },
+            Err(error) => PolicyResult {
+                ctx,
+                request,
+                output: PolicyOutput::Abort(error),
+            },
+        }
+    }
+}
+
 /// A [`Layer`] that listens for TCP connections.
-#[derive(Clone, Debug, Default)]
-pub struct TcpListenerLayer {
+#[derive(Clone, Debug)]
+pub struct TcpListenerLayer<P = UnlimitedPolicy> {
     cancellation: CancellationToken,
+    policy: P,
+}
+
+impl Default for TcpListenerLayer {
+    fn default() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            policy: UnlimitedPolicy::new(),
+        }
+    }
 }
 
 impl TcpListenerLayer {
     pub fn new(cancellation: CancellationToken) -> Self {
-        Self { cancellation }
+        Self {
+            cancellation,
+            policy: UnlimitedPolicy::new(),
+        }
     }
 }
 
-impl<S> Layer<S> for TcpListenerLayer {
-    type Service = TcpListenerService<CloneConnectionService<S>>;
+impl<P> TcpListenerLayer<P> {
+    /// Use the Rama limit `policy` before accepting each connection.
+    pub fn with_policy<Q>(self, policy: Q) -> TcpListenerLayer<Q> {
+        TcpListenerLayer {
+            cancellation: self.cancellation,
+            policy,
+        }
+    }
+}
+
+impl<S, P> Layer<S> for TcpListenerLayer<P>
+where
+    P: Clone,
+{
+    type Service = TcpListenerService<CloneConnectionService<S>, P>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service::new(
+        TcpListenerService::new(
             self.cancellation.clone(),
             CloneConnectionService::new(inner),
         )
+        .with_policy(self.policy.clone())
     }
 }
 
@@ -177,10 +283,16 @@ impl<S> Layer<S> for TcpListenerLayer {
 /// for each accepted socket. The listener owns all spawned connection tasks,
 /// reaps completed tasks while it is running, and aborts and reaps outstanding
 /// tasks when its cancellation token is cancelled.
+///
+/// The admission policy runs before `accept`, so an exhausted policy leaves
+/// sockets in the kernel backlog on every target. The listener can hold one
+/// prospective connection guard while waiting for a socket; that guard becomes
+/// the accepted connection's guard without replacement.
 #[derive(Clone)]
-pub struct TcpListenerService<M> {
+pub struct TcpListenerService<M, P = UnlimitedPolicy> {
     cancellation: CancellationToken,
     make_connection: M,
+    policy: P,
 }
 
 impl<M> TcpListenerService<M> {
@@ -190,27 +302,69 @@ impl<M> TcpListenerService<M> {
         Self {
             cancellation,
             make_connection,
+            policy: UnlimitedPolicy::new(),
         }
     }
 }
 
-impl<M> Debug for TcpListenerService<M> {
+impl<M, P> TcpListenerService<M, P> {
+    /// Use the Rama limit `policy` before accepting each connection.
+    pub fn with_policy<Q>(self, policy: Q) -> TcpListenerService<M, Q> {
+        TcpListenerService {
+            cancellation: self.cancellation,
+            make_connection: self.make_connection,
+            policy,
+        }
+    }
+}
+
+impl<M, P> Debug for TcpListenerService<M, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(TcpListenerService)).finish()
     }
 }
 
-impl<State, M, S> Service<State, TcpListener> for TcpListenerService<M>
+impl<M, P> TcpListenerService<M, P> {
+    async fn admit<State>(
+        &self,
+        mut ctx: Context<State>,
+    ) -> Result<Option<(Context<State>, P::Guard)>, P::Error>
+    where
+        P: Policy<State, AcceptIntent>,
+        State: Clone + Send + Sync + 'static,
+    {
+        let mut request = AcceptIntent;
+
+        loop {
+            let result = tokio::select! {
+                result = self.policy.check(ctx, request) => result,
+                () = self.cancellation.cancelled() => return Ok(None),
+            };
+            ctx = result.ctx;
+            request = result.request;
+
+            match result.output {
+                PolicyOutput::Ready(guard) => return Ok(Some((ctx, guard))),
+                PolicyOutput::Retry => continue,
+                PolicyOutput::Abort(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl<State, M, S, P> Service<State, TcpListener> for TcpListenerService<M, P>
 where
     M: Service<State, ConnectionInfo, Response = S>,
     M::Error: Debug,
     S: Service<State, TcpStream>,
     S::Response: Debug,
-    S::Error: Debug + From<io::Error>,
+    S::Error: Debug,
+    P: Policy<State, AcceptIntent>,
+    P::Error: error::Error + 'static,
     State: Clone + Send + Sync + 'static,
 {
     type Response = ();
-    type Error = S::Error;
+    type Error = TcpListenerError<P::Error>;
 
     #[instrument(skip(ctx, req))]
     async fn serve(
@@ -220,46 +374,51 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let mut connections = JoinSet::new();
 
-        loop {
-            tokio::select! {
-                accepted = req.accept() => {
-                    let (stream, peer_addr) = accepted?;
-                    let connection = ConnectionInfo {
-                        local_addr: stream.local_addr()?,
-                        peer_addr,
-                    };
-                    debug!(?connection);
+        'listener: loop {
+            let Some((connection_ctx, lease)) = self
+                .admit(ctx.clone())
+                .await
+                .map_err(TcpListenerError::Policy)?
+            else {
+                break;
+            };
 
-                    let service = match self
-                        .make_connection
-                        .serve(ctx.clone(), connection)
-                        .await
-                    {
-                        Ok(service) => service,
-                        Err(error) => {
-                            error!(?connection, ?error, "unable to construct connection service");
-                            continue;
-                        }
-                    };
-                    let connection_ctx = ctx.clone();
-
-                    let _connection_task = connections.spawn(async move {
-                        match service.serve(connection_ctx, stream).await {
-                            Err(error) => debug!(?connection, ?error),
-                            Ok(response) => debug!(?connection, ?response),
-                        }
-                    });
+            let (stream, peer_addr) = loop {
+                tokio::select! {
+                    accepted = req.accept() => break accepted?,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        debug!(?joined);
+                    }
+                    () = self.cancellation.cancelled() => break 'listener,
                 }
+            };
+            let connection = ConnectionInfo {
+                local_addr: stream.local_addr()?,
+                peer_addr,
+            };
+            debug!(?connection);
 
-                joined = connections.join_next(), if !connections.is_empty() => {
-                    debug!(?joined);
+            let service = match tokio::select! {
+                result = self.make_connection.serve(connection_ctx.clone(), connection) => result,
+                () = self.cancellation.cancelled() => break 'listener,
+            } {
+                Ok(service) => service,
+                Err(error) => {
+                    error!(
+                        ?connection,
+                        ?error,
+                        "unable to construct connection service"
+                    );
+                    continue;
                 }
-
-                () = self.cancellation.cancelled() => {
-                    debug!("TCP listener cancellation requested");
-                    break;
+            };
+            let _connection_task = connections.spawn(async move {
+                let _lease = lease;
+                match service.serve(connection_ctx, stream).await {
+                    Err(error) => debug!(?connection, ?error),
+                    Ok(response) => debug!(?connection, ?response),
                 }
-            }
+            });
         }
 
         connections.shutdown().await;
@@ -600,21 +759,31 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::num::NonZeroUsize;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
-    use rama::{Context, Layer as _, Service as _};
+    use rama::{
+        Context, Layer as _, Service as _,
+        layer::limit::policy::{Policy, PolicyOutput, PolicyResult},
+    };
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, oneshot},
+        sync::{Semaphore, mpsc, oneshot},
         time::{Duration, timeout},
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{ConnectionInfo, FrameLength, TcpBytesLayer, TcpContext, TcpListenerService};
+    use super::{
+        AcceptIntent, ConnectionInfo, FixedConnectionPolicy, FrameLength, TcpBytesLayer,
+        TcpContext, TcpListenerService,
+    };
     use crate::Error;
 
     #[derive(Clone, Debug)]
@@ -674,6 +843,118 @@ mod tests {
             let _drop_count = DropCount(self.drops.clone());
             self.started.send(self.connection).unwrap();
             std::future::pending().await
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MakeByteConnection {
+        started: mpsc::UnboundedSender<ConnectionInfo>,
+    }
+
+    impl rama::Service<(), ConnectionInfo> for MakeByteConnection {
+        type Response = ByteConnection;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            connection: ConnectionInfo,
+        ) -> Result<Self::Response, Self::Error> {
+            Ok(ByteConnection {
+                connection,
+                started: self.started.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ByteConnection {
+        connection: ConnectionInfo,
+        started: mpsc::UnboundedSender<ConnectionInfo>,
+    }
+
+    impl rama::Service<(), TcpStream> for ByteConnection {
+        type Response = ();
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            mut stream: TcpStream,
+        ) -> Result<Self::Response, Self::Error> {
+            self.started.send(self.connection).unwrap();
+            _ = stream.read_u8().await?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct GatedPolicy {
+        gate: Arc<Semaphore>,
+        started: mpsc::UnboundedSender<()>,
+        ready: mpsc::UnboundedSender<()>,
+        dropped: mpsc::UnboundedSender<()>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct CountingLease {
+        dropped: mpsc::UnboundedSender<()>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountingLease {
+        fn drop(&mut self) {
+            _ = self.drops.fetch_add(1, Ordering::SeqCst);
+            self.dropped.send(()).unwrap();
+        }
+    }
+
+    impl Policy<(), AcceptIntent> for GatedPolicy {
+        type Guard = CountingLease;
+        type Error = io::Error;
+
+        async fn check(
+            &self,
+            ctx: Context<()>,
+            request: AcceptIntent,
+        ) -> PolicyResult<(), AcceptIntent, Self::Guard, Self::Error> {
+            self.started.send(()).unwrap();
+            let output = match self.gate.clone().acquire_owned().await {
+                Ok(permit) => {
+                    permit.forget();
+                    self.ready.send(()).unwrap();
+                    PolicyOutput::Ready(CountingLease {
+                        dropped: self.dropped.clone(),
+                        drops: self.drops.clone(),
+                    })
+                }
+                Err(error) => PolicyOutput::Abort(io::Error::other(error.to_string())),
+            };
+            PolicyResult {
+                ctx,
+                request,
+                output,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RejectConnection {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl rama::Service<(), ConnectionInfo> for RejectConnection {
+        type Response = PendingConnection;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            _connection: ConnectionInfo,
+        ) -> Result<Self::Response, Self::Error> {
+            _ = self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Message("factory rejected connection".into()))
         }
     }
 
@@ -839,5 +1120,179 @@ mod tests {
         assert_eq!(2, drops.load(Ordering::SeqCst));
 
         drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn connection_limit_leaves_excess_socket_in_kernel_backlog() {
+        let cancellation = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let policy = FixedConnectionPolicy::new(NonZeroUsize::MIN);
+        let service = TcpListenerService::new(
+            cancellation.clone(),
+            MakeByteConnection {
+                started: started_tx,
+            },
+        )
+        .with_policy(policy.clone());
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let _listener_task = tokio::spawn(async move {
+            let result = service.serve(Context::default(), listener).await;
+            finished_tx.send(result).unwrap();
+        });
+
+        let mut first = TcpStream::connect(local_addr).await.unwrap();
+        _ = timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(0, policy.available_permits());
+
+        let second = timeout(Duration::from_secs(1), TcpStream::connect(local_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), started_rx.recv())
+                .await
+                .is_err()
+        );
+
+        first.write_u8(1).await.unwrap();
+        _ = timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(0, policy.available_permits());
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, policy.available_permits());
+
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_prospective_connection_guard_once() {
+        let cancellation = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service_drops = Arc::new(AtomicUsize::new(0));
+        let (connection_tx, _connection_rx) = mpsc::unbounded_channel();
+        let (admission_tx, mut admission_rx) = mpsc::unbounded_channel();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let service = TcpListenerService::new(
+            cancellation.clone(),
+            MakeConnection {
+                calls: calls.clone(),
+                started: connection_tx,
+                drops: service_drops,
+            },
+        )
+        .with_policy(GatedPolicy {
+            gate: gate.clone(),
+            started: admission_tx,
+            ready: ready_tx,
+            dropped: dropped_tx,
+            drops: lease_drops.clone(),
+        });
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let _listener_task = tokio::spawn(async move {
+            let result = service.serve(Context::default(), listener).await;
+            finished_tx.send(result).unwrap();
+        });
+
+        timeout(Duration::from_secs(1), admission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.add_permits(1);
+        timeout(Duration::from_secs(1), ready_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(0, lease_drops.load(Ordering::SeqCst));
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+        assert_eq!(0, calls.load(Ordering::SeqCst));
+
+        timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn factory_failure_drops_admission_lease_once() {
+        let cancellation = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (admission_tx, mut admission_rx) = mpsc::unbounded_channel();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let service = TcpListenerService::new(
+            cancellation.clone(),
+            RejectConnection {
+                calls: calls.clone(),
+            },
+        )
+        .with_policy(GatedPolicy {
+            gate: gate.clone(),
+            started: admission_tx,
+            ready: ready_tx,
+            dropped: dropped_tx,
+            drops: lease_drops.clone(),
+        });
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let _listener_task = tokio::spawn(async move {
+            let result = service.serve(Context::default(), listener).await;
+            finished_tx.send(result).unwrap();
+        });
+
+        let client = TcpStream::connect(local_addr).await.unwrap();
+        timeout(Duration::from_secs(1), admission_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.add_permits(1);
+        timeout(Duration::from_secs(1), ready_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+        assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+
+        cancellation.cancel();
+        timeout(Duration::from_secs(1), finished_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(1, lease_drops.load(Ordering::SeqCst));
+
+        drop(client);
     }
 }
