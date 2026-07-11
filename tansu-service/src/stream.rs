@@ -107,10 +107,10 @@ impl FrameLength {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestHead {
-    body_len: usize,
-    api_key: i16,
-    api_version: i16,
-    correlation_id: i32,
+    pub(crate) body_len: usize,
+    pub(crate) api_key: i16,
+    pub(crate) api_version: i16,
+    pub(crate) correlation_id: i32,
 }
 
 /// A complete Kafka frame coupled to the guard that admitted its body.
@@ -198,6 +198,16 @@ pub struct AdmittedReply<L, T = Bytes> {
     pub(crate) head: RequestHead,
     pub(crate) payload: T,
     pub(crate) lease: L,
+}
+
+/// The wire action selected after an admitted request has been handled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Reply {
+    /// Write one complete length-prefixed Kafka response frame.
+    Frame(Bytes),
+
+    /// Complete the request without writing protocol bytes.
+    NoResponse,
 }
 
 impl<L, T> AdmittedReply<L, T> {
@@ -953,7 +963,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         ctx: Context<State>,
     ) -> Result<(), RequestAdmissionError<P::Error, S::Error>>
     where
-        S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard>>,
+        S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard, Reply>>,
         P: Policy<State, RequestHead>,
         P::Error: error::Error + 'static,
         S::Error: error::Error + 'static,
@@ -1002,17 +1012,19 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
 
         let AdmittedReply { payload, lease, .. } = reply;
         let _lease = lease;
-        let mut writer = BufWriter::new(stream);
-        writer.write_all(&payload).await?;
-        BYTES_SENT.add(payload.len() as u64, &[]);
-        writer.flush().await?;
+        if let Reply::Frame(payload) = payload {
+            let mut writer = BufWriter::new(stream);
+            writer.write_all(&payload).await?;
+            BYTES_SENT.add(payload.len() as u64, &[]);
+            writer.flush().await?;
+        }
         Ok(())
     }
 }
 
 impl<S, State, P, Stream> Service<TcpContext, Stream> for AdmittedTcpBytesService<S, State, P>
 where
-    S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard>>,
+    S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard, Reply>>,
     P: Policy<State, RequestHead>,
     P::Error: error::Error + 'static,
     S::Error: error::Error + 'static,
@@ -1254,6 +1266,10 @@ mod tests {
         Context, Layer as _, Service as _,
         layer::limit::policy::{Policy, PolicyOutput, PolicyResult},
     };
+    use tansu_sans_io::{
+        ApiKey as _, Body, Frame, Header, ProduceRequest, ProduceResponse,
+        produce_response::TopicProduceResponse,
+    };
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _, duplex},
         net::{TcpListener, TcpStream},
@@ -1264,10 +1280,10 @@ mod tests {
 
     use super::{
         AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo,
-        FixedConnectionPolicy, FrameLength, RequestAdmissionError, RequestHead, TcpBytesLayer,
-        TcpContext, TcpListenerService,
+        FixedConnectionPolicy, FrameLength, Reply, RequestAdmissionError, RequestHead,
+        TcpBytesLayer, TcpContext, TcpListenerService,
     };
-    use crate::Error;
+    use crate::{BytesFrameLayer, Error};
 
     #[derive(Clone, Debug)]
     struct EchoService {
@@ -1348,8 +1364,59 @@ mod tests {
         fail: bool,
     }
 
+    #[derive(Clone, Debug)]
+    struct ProduceSequenceService {
+        calls: Arc<AtomicUsize>,
+        handled: mpsc::UnboundedSender<i32>,
+    }
+
+    impl rama::Service<(), Frame> for ProduceSequenceService {
+        type Response = Frame;
+        type Error = Error;
+
+        async fn serve(
+            &self,
+            _ctx: Context<()>,
+            req: Frame,
+        ) -> Result<Self::Response, Self::Error> {
+            let correlation_id = req.correlation_id()?;
+            self.handled.send(correlation_id).unwrap();
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(Error::Message("first produce failed".into()));
+            }
+
+            Ok(Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: Body::ProduceResponse(
+                    ProduceResponse::default()
+                        .responses(Some(Vec::<TopicProduceResponse>::new()))
+                        .throttle_time_ms(Some(0)),
+                ),
+            })
+        }
+    }
+
+    fn encoded_produce(acks: i16, correlation_id: i32) -> bytes::Bytes {
+        Frame::request(
+            Header::Request {
+                api_key: ProduceRequest::KEY,
+                api_version: 3,
+                correlation_id,
+                client_id: Some("test".into()),
+            },
+            Body::ProduceRequest(
+                ProduceRequest::default()
+                    .acks(acks)
+                    .timeout_ms(1_000)
+                    .topic_data(Some(Vec::new())),
+            ),
+        )
+        .unwrap()
+    }
+
     impl rama::Service<(), AdmittedFrame<RequestLease>> for AdmittedEchoService {
-        type Response = AdmittedReply<RequestLease>;
+        type Response = AdmittedReply<RequestLease, Reply>;
         type Error = Error;
 
         async fn serve(
@@ -1362,7 +1429,7 @@ mod tests {
                 Err(Error::Message("handler failed".into()))
             } else {
                 let payload = req.payload().clone();
-                Ok(req.reply(payload))
+                Ok(req.reply(Reply::Frame(payload)))
             }
         }
     }
@@ -1625,7 +1692,7 @@ mod tests {
         };
 
         frame.adjust_lease(128).unwrap();
-        let reply = frame.map_payload(|_| ()).reply(bytes::Bytes::new());
+        let reply = frame.map_payload(|_| ()).reply(Reply::NoResponse);
         assert_eq!(91, reply.lease.identity);
         assert_eq!(128, reply.lease.reservation);
     }
@@ -1845,6 +1912,69 @@ mod tests {
         ));
         assert_eq!(73, observed_rx.recv().await.unwrap());
         assert_eq!(1, drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn produce_acks_zero_writes_nothing_and_preserves_stream_alignment() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (handled_tx, mut handled_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(2)),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .into_layer(
+                BytesFrameLayer::default().into_layer(ProduceSequenceService {
+                    calls: calls.clone(),
+                    handled: handled_tx,
+                }),
+            );
+        let (mut client, server) = duplex(512);
+        let server = tokio::spawn(async move {
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(256))),
+                    server,
+                )
+                .await
+        });
+
+        client.write_all(&encoded_produce(0, 101)).await.unwrap();
+        assert_eq!(101, handled_rx.recv().await.unwrap());
+        assert!(
+            timeout(Duration::from_millis(50), client.read_u8())
+                .await
+                .is_err()
+        );
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+
+        client.write_all(&encoded_produce(1, 102)).await.unwrap();
+        assert_eq!(102, handled_rx.recv().await.unwrap());
+        let mut prefix = [0u8; 4];
+        _ = client.read_exact(&mut prefix).await.unwrap();
+        let body_len = usize::try_from(i32::from_be_bytes(prefix)).unwrap();
+        let mut response = vec![0u8; body_len + prefix.len()];
+        response[..prefix.len()].copy_from_slice(&prefix);
+        _ = client
+            .read_exact(&mut response[prefix.len()..])
+            .await
+            .unwrap();
+        let response =
+            Frame::response_from_bytes(bytes::Bytes::from(response), ProduceRequest::KEY, 3)
+                .unwrap();
+        assert_eq!(102, response.correlation_id().unwrap());
+        assert_eq!(2, calls.load(Ordering::SeqCst));
+        assert_eq!(2, drops.load(Ordering::SeqCst));
+
+        client.shutdown().await.unwrap();
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(RequestAdmissionError::Io(_))
+        ));
     }
 
     #[tokio::test]

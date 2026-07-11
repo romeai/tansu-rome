@@ -272,7 +272,7 @@ pub use frame::{
 pub use stream::{
     AcceptIntent, AdmissionLease, AdmittedFrame, AdmittedReply, AdmittedTcpBytesLayer,
     AdmittedTcpBytesService, BytesLayer, BytesService, BytesTcpService, CloneConnectionService,
-    ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, RequestAdmissionError,
+    ConnectionInfo, FixedConnectionLease, FixedConnectionPolicy, Reply, RequestAdmissionError,
     RequestHead, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
     TcpListenerError, TcpListenerLayer, TcpListenerService,
 };
