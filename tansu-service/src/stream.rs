@@ -41,6 +41,9 @@ const FRAME_LENGTH_PREFIX_BYTES: usize = size_of::<i32>();
 /// Minimum Kafka request body: API key, API version, and correlation ID.
 const MINIMUM_REQUEST_BODY_BYTES: usize = size_of::<i16>() * 2 + size_of::<i32>();
 
+/// Bytes in the length prefix and fixed Kafka request header fields.
+const REQUEST_HEAD_BYTES: usize = FRAME_LENGTH_PREFIX_BYTES + MINIMUM_REQUEST_BODY_BYTES;
+
 /// Minimum Kafka response body: correlation ID.
 const MINIMUM_RESPONSE_BODY_BYTES: usize = size_of::<i32>();
 
@@ -103,6 +106,78 @@ impl FrameLength {
         } else {
             Ok(self)
         }
+    }
+}
+
+/// The allocation-free portion of an incoming Kafka request.
+///
+/// This head is read and validated before storage for the complete frame is
+/// allocated. `body_len` excludes Kafka's four-byte signed length prefix.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestHead {
+    body_len: usize,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+}
+
+impl RequestHead {
+    fn decode(
+        encoded: [u8; REQUEST_HEAD_BYTES],
+        maximum_frame_size: Option<usize>,
+    ) -> Result<(Self, FrameLength), Error> {
+        let length = FrameLength::request(
+            encoded[..FRAME_LENGTH_PREFIX_BYTES]
+                .try_into()
+                .expect("the request head contains a complete length prefix"),
+            maximum_frame_size,
+        )?;
+        let api_key = i16::from_be_bytes(
+            encoded[4..6]
+                .try_into()
+                .expect("the request head contains a complete API key"),
+        );
+        let api_version = i16::from_be_bytes(
+            encoded[6..8]
+                .try_into()
+                .expect("the request head contains a complete API version"),
+        );
+        let correlation_id = i32::from_be_bytes(
+            encoded[8..12]
+                .try_into()
+                .expect("the request head contains a complete correlation ID"),
+        );
+
+        Ok((
+            Self {
+                body_len: length.body,
+                api_key,
+                api_version,
+                correlation_id,
+            },
+            length,
+        ))
+    }
+
+    /// Return the declared Kafka request body length, excluding its prefix.
+    pub fn body_len(&self) -> usize {
+        self.body_len
+    }
+
+    /// Return the signed Kafka API key without interpreting whether it is known.
+    pub fn api_key(&self) -> i16 {
+        self.api_key
+    }
+
+    /// Return the requested Kafka API version without route validation.
+    pub fn api_version(&self) -> i16 {
+        self.api_version
+    }
+
+    /// Return the correlation ID copied into the corresponding response.
+    pub fn correlation_id(&self) -> i32 {
+        self.correlation_id
     }
 }
 
@@ -642,31 +717,53 @@ where
         &self,
         req: &mut R,
         maximum_frame_size: Option<usize>,
-    ) -> Result<FrameLength, S::Error>
+    ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut size = [0u8; FRAME_LENGTH_PREFIX_BYTES];
+        let mut head = [0u8; REQUEST_HEAD_BYTES];
 
         _ = req
-            .read_exact(&mut size)
+            .read_exact(&mut head[..FRAME_LENGTH_PREFIX_BYTES])
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        FrameLength::request(size, maximum_frame_size).map_err(Into::into)
+        // Validate the declared body before reading even the fixed request
+        // header. In particular, an oversized declaration never controls an
+        // allocation or causes additional body bytes to be consumed.
+        _ = FrameLength::request(
+            head[..FRAME_LENGTH_PREFIX_BYTES]
+                .try_into()
+                .expect("the request head contains a complete length prefix"),
+            maximum_frame_size,
+        )?;
+
+        _ = req
+            .read_exact(&mut head[FRAME_LENGTH_PREFIX_BYTES..])
+            .await
+            .inspect_err(|err| debug!(?err))?;
+
+        RequestHead::decode(head, maximum_frame_size)
+            .map(|(request_head, length)| (request_head, length, head))
+            .map_err(Into::into)
     }
 
     #[instrument(skip_all)]
-    async fn read<R>(&self, req: &mut R, length: FrameLength) -> Result<Bytes, S::Error>
+    async fn read<R>(
+        &self,
+        req: &mut R,
+        length: FrameLength,
+        head: [u8; REQUEST_HEAD_BYTES],
+    ) -> Result<Bytes, S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
         let mut request: Vec<u8> = vec![0u8; length.complete];
 
-        request[0..FRAME_LENGTH_PREFIX_BYTES].copy_from_slice(&length.declared.to_be_bytes());
+        request[..REQUEST_HEAD_BYTES].copy_from_slice(&head);
 
         _ = req
-            .read_exact(&mut request[FRAME_LENGTH_PREFIX_BYTES..])
+            .read_exact(&mut request[REQUEST_HEAD_BYTES..])
             .await
             .inspect_err(|err| error!(?err))?;
         BYTES_RECEIVED.add(request.len() as u64, &[]);
@@ -721,8 +818,8 @@ where
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let length = self.wait(req, maximum_frame_size).await?;
-        let request = self.read(req, length).await?;
+        let (_head, length, encoded_head) = self.wait(req, maximum_frame_size).await?;
+        let request = self.read(req, length, encoded_head).await?;
         let response = self.process(attributes, ctx, request).await?;
         self.write(req, response).await
     }
@@ -835,8 +932,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AcceptIntent, ConnectionInfo, FixedConnectionPolicy, FrameLength, TcpBytesLayer,
-        TcpContext, TcpListenerService,
+        AcceptIntent, ConnectionInfo, FixedConnectionPolicy, FrameLength, RequestHead,
+        TcpBytesLayer, TcpContext, TcpListenerService,
     };
     use crate::Error;
 
@@ -1093,6 +1190,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn request_head_exposes_fixed_fields_without_interpreting_the_api() {
+        let encoded = [0, 0, 0, 8, 0x7f, 0xff, 0xff, 0xfe, 0, 0, 0, 42];
+        let (head, length) = RequestHead::decode(encoded, Some(8)).unwrap();
+
+        assert_eq!(8, head.body_len());
+        assert_eq!(i16::MAX, head.api_key());
+        assert_eq!(-2, head.api_version());
+        assert_eq!(42, head.correlation_id());
+        assert_eq!(12, length.complete);
+    }
+
     #[tokio::test]
     async fn rejected_length_never_enters_inner_service() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1138,6 +1247,37 @@ mod tests {
         });
 
         client.write_all(&request).await.unwrap();
+        let mut response = [0; 12];
+        _ = client.read_exact(&mut response).await.unwrap();
+        assert_eq!(request, response);
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+
+        client.shutdown().await.unwrap();
+        assert!(matches!(server.await.unwrap(), Err(Error::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn fragmented_request_head_is_reassembled_before_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = TcpBytesLayer::<()>::default().into_layer(EchoService {
+            calls: calls.clone(),
+        });
+        let (mut client, server) = duplex(64);
+        let request = [0, 0, 0, 8, 0, 3, 0, 1, 0, 0, 0, 42];
+
+        let server = tokio::spawn(async move {
+            service
+                .serve(
+                    Context::with_state(TcpContext::default().maximum_frame_size(Some(8))),
+                    server,
+                )
+                .await
+        });
+
+        for byte in request {
+            client.write_all(&[byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
         let mut response = [0; 12];
         _ = client.read_exact(&mut response).await.unwrap();
         assert_eq!(request, response);
