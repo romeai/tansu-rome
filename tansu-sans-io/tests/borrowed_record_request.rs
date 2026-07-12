@@ -94,9 +94,13 @@ fn generated_view_tracks_all_produce_versions_and_flexible_cutover() -> tansu_sa
         assert_eq!(-1, request.acks());
         assert_eq!(1_500, request.timeout_ms());
 
-        let topic = request.topic_data().next().expect("one topic")?;
+        let mut work = request.work_budget()?;
+        let topic = request.topic_data().next(&mut work).expect("one topic")?;
         assert_eq!("events", topic.name()?);
-        let partition = topic.partition_data().next().expect("one partition")?;
+        let partition = topic
+            .partition_data()
+            .next(&mut work)
+            .expect("one partition")?;
         assert_eq!(3, partition.index());
         assert_eq!(Some(&[][..]), partition.records_bytes());
     }
@@ -120,8 +124,12 @@ fn nullable_records_preserve_null_and_empty_in_legacy_and_compact_encodings()
             )],
         )?;
         let request = BorrowedProduceRequest::from_bytes(encoded.clone())?;
-        let topic = request.topic_data().next().expect("one topic")?;
-        let first = topic.partition_data().next().expect("one partition")?;
+        let mut work = request.work_budget()?;
+        let topic = request.topic_data().next(&mut work).expect("one topic")?;
+        let first = topic
+            .partition_data()
+            .next(&mut work)
+            .expect("one partition")?;
         let records = first
             .records_bytes()
             .expect("owned encoder represents None as empty");
@@ -135,18 +143,22 @@ fn nullable_records_preserve_null_and_empty_in_legacy_and_compact_encodings()
             nullable[records_start - size_of::<u8>()] = 0;
         }
         let request = BorrowedProduceRequest::from_bytes(nullable.freeze())?;
-        let topic = request.topic_data().next().expect("one topic")?;
+        let mut work = request.work_budget()?;
+        let topic = request.topic_data().next(&mut work).expect("one topic")?;
         let mut partitions = topic.partition_data();
         assert!(
             partitions
-                .next()
+                .next(&mut work)
                 .expect("null records")?
                 .records_bytes()
                 .is_none()
         );
         assert_eq!(
             Some(&[][..]),
-            partitions.next().expect("empty records")?.records_bytes()
+            partitions
+                .next(&mut work)
+                .expect("empty records")?
+                .records_bytes()
         );
     }
     Ok(())
@@ -166,11 +178,15 @@ fn descendant_strings_and_records_share_the_retained_frame() -> tansu_sans_io::R
         )],
     )?;
     let request = BorrowedProduceRequest::from_bytes(encoded.clone())?;
+    let mut work = request.work_budget()?;
     let start = request.frame().as_ptr() as usize;
     let end = start + request.frame().len();
-    let topic = request.topic_data().next().expect("one topic")?;
+    let topic = request.topic_data().next(&mut work).expect("one topic")?;
     let name = topic.name()?;
-    let partition = topic.partition_data().next().expect("one partition")?;
+    let partition = topic
+        .partition_data()
+        .next(&mut work)
+        .expect("one partition")?;
     let records = partition.records_bytes().expect("records");
 
     assert!((start..end).contains(&(name.as_ptr() as usize)));
@@ -193,19 +209,21 @@ fn record_payload_is_opaque_to_request_validation() -> tansu_sans_io::Result<()>
         )],
     )?;
     let request = BorrowedProduceRequest::from_bytes(encoded.clone())?;
-    let topic = request.topic_data().next().expect("topic")?;
-    let partition = topic.partition_data().next().expect("partition")?;
+    let mut work = request.work_budget()?;
+    let topic = request.topic_data().next(&mut work).expect("topic")?;
+    let partition = topic.partition_data().next(&mut work).expect("partition")?;
     let records = partition.records_bytes().expect("records");
     let last = records.as_ptr() as usize - encoded.as_ptr() as usize + records.len() - 1;
 
     let mut corrupt = BytesMut::from(&encoded[..]);
     corrupt[last] ^= 1;
     let request = BorrowedProduceRequest::from_bytes(corrupt.freeze())?;
-    let topic = request.topic_data().next().expect("topic")?;
+    let mut work = request.work_budget()?;
+    let topic = request.topic_data().next(&mut work).expect("topic")?;
     assert!(
         topic
             .partition_data()
-            .next()
+            .next(&mut work)
             .expect("partition")?
             .records_bytes()
             .is_some()
@@ -257,8 +275,15 @@ fn high_cardinality_views_retain_constant_sized_state() -> tansu_sans_io::Result
             ..DecodeLimits::default()
         },
     )?;
-    let topic = request.topic_data().next().expect("topic")?;
-    assert_eq!(PARTITIONS, topic.partition_data().count());
+    let mut work = request.work_budget()?;
+    let topic = request.topic_data().next(&mut work).expect("topic")?;
+    let mut partitions = topic.partition_data();
+    let mut count = 0;
+    while let Some(partition) = partitions.next(&mut work) {
+        let _ = partition?;
+        count += 1;
+    }
+    assert_eq!(PARTITIONS, count);
     assert!(size_of_val(&request) < 256);
     Ok(())
 }
@@ -288,5 +313,71 @@ fn structural_limits_apply_before_lending_descendants() -> tansu_sans_io::Result
             actual: 5,
         }
     ));
+    Ok(())
+}
+
+#[test]
+fn repeated_traversal_debits_one_caller_owned_work_budget() -> tansu_sans_io::Result<()> {
+    let encoded = encoded_request(
+        9,
+        [
+            topic(
+                "events-0",
+                [PartitionProduceData::default().index(0).records(None)],
+            ),
+            topic(
+                "events-1",
+                [PartitionProduceData::default().index(1).records(None)],
+            ),
+        ],
+    )?;
+    let measured = BorrowedProduceRequest::from_bytes(encoded.clone())?;
+    let mut measured_work = measured.work_budget()?;
+    let structural = measured_work.attempted();
+    let topic = measured
+        .topic_data()
+        .next(&mut measured_work)
+        .expect("topic")?;
+    let _partition = topic
+        .partition_data()
+        .next(&mut measured_work)
+        .expect("partition")?;
+    let one_traversal = measured_work.attempted() - structural;
+    assert!(one_traversal > 0);
+
+    let request = BorrowedProduceRequest::from_bytes_with_limits(
+        encoded,
+        DecodeLimits {
+            max_total_work_units: structural + one_traversal,
+            ..DecodeLimits::default()
+        },
+    )?;
+    let mut work = request.work_budget()?;
+    let topic = request.topic_data().next(&mut work).expect("topic")?;
+    let _partition = topic.partition_data().next(&mut work).expect("partition")?;
+    let mut replay = request.topic_data();
+    let error = replay.next(&mut work).expect("replayed topic").unwrap_err();
+    assert!(matches!(
+        error,
+        Error::DecodeLimitExceeded {
+            kind: DecodeLimit::TotalWorkUnits,
+            ..
+        }
+    ));
+    let attempted = work.attempted();
+    let remaining = replay.len();
+    let error = replay
+        .next(&mut work)
+        .expect("exhausted replay budget remains an error")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::DecodeLimitExceeded {
+            kind: DecodeLimit::TotalWorkUnits,
+            ..
+        }
+    ));
+    assert_eq!(attempted, work.attempted());
+    assert_eq!(remaining, replay.len());
     Ok(())
 }

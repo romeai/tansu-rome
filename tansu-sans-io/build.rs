@@ -1675,7 +1675,7 @@ fn borrowed_nested_struct(parent: &Field) -> TokenStream {
         ///
         /// Items remain `Result` so replay defensively checks the already validated byte
         /// boundaries without retaining a peer-cardinality-sized range table.
-        #[derive(Clone, Debug)]
+        #[derive(Debug)]
         pub struct #iterator<'a> {
             cursor: crate::borrowed::Cursor<'a>,
             remaining: usize,
@@ -1683,23 +1683,35 @@ fn borrowed_nested_struct(parent: &Field) -> TokenStream {
             flexible: bool,
         }
 
-        impl<'a> Iterator for #iterator<'a> {
-            type Item = crate::Result<#borrowed<'a>>;
-
-            fn next(&mut self) -> Option<Self::Item> {
+        impl<'a> #iterator<'a> {
+            /// Parse the next element and debit its attempted work from the request budget.
+            pub fn next(
+                &mut self,
+                work: &mut crate::BorrowedWorkBudget,
+            ) -> Option<crate::Result<#borrowed<'a>>> {
                 if self.remaining == 0 {
                     return None;
                 }
+                if let Err(error) = work.charge(0) {
+                    return Some(Err(error));
+                }
                 self.remaining -= 1;
-                Some(#parse(&mut self.cursor, self.api_version, self.flexible))
+                let before = self.cursor.work_units();
+                let parsed = #parse(&mut self.cursor, self.api_version, self.flexible);
+                let attempted = self.cursor.work_units().saturating_sub(before);
+                Some(work.charge(attempted).and(parsed))
             }
 
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                (self.remaining, Some(self.remaining))
+            /// Number of elements which have not yet been attempted.
+            pub fn len(&self) -> usize {
+                self.remaining
+            }
+
+            /// Whether every declared element has been attempted.
+            pub fn is_empty(&self) -> bool {
+                self.remaining == 0
             }
         }
-
-        impl ExactSizeIterator for #iterator<'_> {}
 
         #(#descendants)*
     }
@@ -1819,6 +1831,7 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                 correlation_id: i32,
                 client_id: Option<std::ops::Range<usize>>,
                 flexible: bool,
+                structural_work_units: usize,
                 #(#definitions,)*
             }
 
@@ -1861,6 +1874,7 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                         cursor.finish()?;
                         (#(#assignments,)*)
                     };
+                    let structural_work_units = cursor.work_units();
                     Ok(Self {
                         frame,
                         limits,
@@ -1868,6 +1882,7 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                         correlation_id: head.correlation_id,
                         client_id: head.client_id,
                         flexible,
+                        structural_work_units,
                         #(#assignments,)*
                     })
                 }
@@ -1893,6 +1908,14 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                         .as_ref()
                         .map(|range| crate::borrowed::borrow_string(&self.frame, range))
                         .transpose()
+                }
+
+                /// Create caller-owned evidence for all traversal after validation.
+                pub fn work_budget(&self) -> crate::Result<crate::BorrowedWorkBudget> {
+                    crate::BorrowedWorkBudget::after_validation(
+                        self.limits,
+                        self.structural_work_units,
+                    )
                 }
 
                 #(#accessors)*

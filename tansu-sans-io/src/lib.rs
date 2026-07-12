@@ -118,6 +118,7 @@
 
 pub mod acl;
 mod borrowed;
+pub use borrowed::BorrowedWorkBudget;
 pub mod consumer;
 pub mod de;
 pub mod primitive;

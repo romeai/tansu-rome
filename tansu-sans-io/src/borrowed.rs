@@ -54,6 +54,38 @@ pub(crate) struct DecodeBudget {
     work_units: usize,
 }
 
+/// Caller-owned cumulative work evidence for replaying borrowed request views.
+///
+/// Borrowed iterators retain no interior mutable state because one request may
+/// be traversed in distinct application phases. Passing this value through
+/// those phases makes every attempted parse consume the same admitted limit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BorrowedWorkBudget {
+    limit: usize,
+    attempted: usize,
+}
+
+impl BorrowedWorkBudget {
+    pub(crate) fn after_validation(limits: DecodeLimits, attempted: usize) -> Result<Self> {
+        let mut budget = Self {
+            limit: limits.max_total_work_units,
+            attempted: 0,
+        };
+        budget.charge(attempted)?;
+        Ok(budget)
+    }
+
+    /// Work units attempted by structural validation and every replay so far.
+    pub fn attempted(&self) -> usize {
+        self.attempted
+    }
+
+    pub(crate) fn charge(&mut self, units: usize) -> Result<()> {
+        self.attempted = self.attempted.checked_add(units).ok_or(Error::Overflow)?;
+        check_limit(DecodeLimit::TotalWorkUnits, self.limit, self.attempted)
+    }
+}
+
 impl DecodeBudget {
     pub(crate) fn new(limits: DecodeLimits) -> Self {
         Self {
@@ -76,7 +108,7 @@ impl DecodeBudget {
     }
 }
 
-// The generator emits calls only for primitive kinds present in today's record-bearing request
+// The generator emits calls only for primitive kinds present in the selected record-bearing request
 // schemas. Keeping the complete primitive cursor here lets a descriptor add another primitive
 // without requiring a handwritten protocol path or silently falling back to owned decoding.
 #[allow(dead_code)]
@@ -163,6 +195,10 @@ impl<'a> Cursor<'a> {
 
     pub(crate) fn limits(&self) -> DecodeLimits {
         self.budget.limits()
+    }
+
+    pub(crate) fn work_units(&self) -> usize {
+        self.budget.work_units
     }
 
     pub(crate) fn finish(&self) -> Result<()> {
