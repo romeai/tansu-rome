@@ -19,11 +19,11 @@ use super::varint::UnsignedVarInt;
 use crate::{ByteSize, Result};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{SeqAccess, Visitor},
+    de::{Error as _, SeqAccess, Visitor},
     ser::SerializeSeq,
 };
 use std::{
-    any::{type_name, type_name_of_val},
+    any::type_name,
     fmt::Formatter,
     io::Cursor,
     iter::{chain, once},
@@ -31,7 +31,128 @@ use std::{
 };
 use tracing::{debug, instrument};
 
-const MAXIMUM_TAGGED_FIELDS: usize = 128;
+/// Serde structure name forming the private contract between [`TagBuffer`]
+/// and the bounded Kafka frame decoder.
+pub(crate) const TAG_BUFFER_WIRE_NAME: &str = "KafkaTagBuffer";
+
+/// Field carrying the counted tag sequence in [`TAG_BUFFER_WIRE_NAME`].
+pub(crate) const TAG_BUFFER_FIELDS_FIELD: &str = "fields";
+
+/// Complete field order for the private [`TAG_BUFFER_WIRE_NAME`] contract.
+pub(crate) const TAG_BUFFER_WIRE_FIELDS: &[&str] = &[TAG_BUFFER_FIELDS_FIELD];
+
+/// Serde structure name forming the private contract for one flexible tag.
+pub(crate) const TAG_FIELD_WIRE_NAME: &str = "KafkaTagField";
+
+/// Field carrying a tag's unsigned-varint identifier.
+pub(crate) const TAG_FIELD_ID_FIELD: &str = "tag";
+
+/// Field carrying a tag's unsigned-varint-length-prefixed payload.
+pub(crate) const TAG_FIELD_DATA_FIELD: &str = "data";
+
+/// Complete field order for the private [`TAG_FIELD_WIRE_NAME`] contract.
+pub(crate) const TAG_FIELD_WIRE_FIELDS: &[&str] = &[TAG_FIELD_ID_FIELD, TAG_FIELD_DATA_FIELD];
+
+#[derive(Debug)]
+struct TagData(Vec<u8>);
+
+impl<'de> Deserialize<'de> for TagData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = TagData;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an unsigned-varint-length-prefixed flexible tag payload")
+            }
+
+            fn visit_byte_buf<E>(self, data: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(TagData(data))
+            }
+        }
+
+        deserializer.deserialize_byte_buf(V)
+    }
+}
+
+#[derive(Debug)]
+struct TagFieldWire {
+    tag: UnsignedVarInt,
+    data: TagData,
+}
+
+impl<'de> Deserialize<'de> for TagFieldWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = TagFieldWire;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(TAG_FIELD_WIRE_NAME)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let tag = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::missing_field(TAG_FIELD_ID_FIELD))?;
+                let data = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::missing_field(TAG_FIELD_DATA_FIELD))?;
+                Ok(TagFieldWire { tag, data })
+            }
+        }
+
+        deserializer.deserialize_struct(TAG_FIELD_WIRE_NAME, TAG_FIELD_WIRE_FIELDS, V)
+    }
+}
+
+#[derive(Debug)]
+struct TagBufferWire {
+    fields: Vec<TagField>,
+}
+
+impl<'de> Deserialize<'de> for TagBufferWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = TagBufferWire;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(TAG_BUFFER_WIRE_NAME)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let fields = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::missing_field(TAG_BUFFER_FIELDS_FIELD))?;
+                Ok(TagBufferWire { fields })
+            }
+        }
+
+        deserializer.deserialize_struct(TAG_BUFFER_WIRE_NAME, TAG_BUFFER_WIRE_FIELDS, V)
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagField(pub u32, pub Vec<u8>);
@@ -92,53 +213,8 @@ impl<'de> Deserialize<'de> for TagField {
     where
         D: Deserializer<'de>,
     {
-        struct V;
-
-        impl<'de> Visitor<'de> for V {
-            type Value = TagField;
-
-            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!(Tag))
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                debug!("seq={}", type_name_of_val(&seq));
-
-                let tag: u32 = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("tag"))?
-                    .into();
-
-                let length: usize = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("length"))?
-                    .into();
-
-                if length > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {length}"
-                    )));
-                }
-
-                (0..length)
-                    .try_fold(Vec::with_capacity(length), |mut acc, _| {
-                        seq.next_element::<u8>()?
-                            .ok_or_else(|| serde::de::Error::custom("byte"))
-                            .map(|byte| {
-                                acc.push(byte);
-                                acc
-                            })
-                    })
-                    .inspect(|data| debug!(?tag, ?data))
-                    .map(|data| TagField(tag, data))
-            }
-        }
-
-        debug!("deserializer={}", type_name_of_val(&deserializer));
-        deserializer.deserialize_seq(V)
+        TagFieldWire::deserialize(deserializer)
+            .map(|TagFieldWire { tag, data }| TagField(tag.into(), data.0))
     }
 }
 
@@ -262,50 +338,19 @@ impl<'de> Deserialize<'de> for TagBuffer {
     where
         D: Deserializer<'de>,
     {
-        struct V;
-
-        impl<'de> Visitor<'de> for V {
-            type Value = TagBuffer;
-
-            fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!(TagBuffer))
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                debug!("seq={}", type_name_of_val(&seq));
-
-                let number_of_tagged_fields: usize = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("tag"))?
-                    .into();
-
-                debug!(?number_of_tagged_fields);
-
-                if number_of_tagged_fields > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {number_of_tagged_fields}"
-                    )));
-                }
-
-                (0..number_of_tagged_fields)
-                    .try_fold(Vec::with_capacity(number_of_tagged_fields), |mut acc, _| {
-                        seq.next_element::<TagField>()?
-                            .ok_or_else(|| serde::de::Error::custom("tagged field"))
-                            .inspect(|tag| debug!(?tag))
-                            .map(|tag| {
-                                acc.push(tag);
-                                acc
-                            })
-                    })
-                    .map(TagBuffer)
-            }
+        let wire = TagBufferWire::deserialize(deserializer)?;
+        if let Some(tags) = wire
+            .fields
+            .windows(2)
+            .find(|tags| tags[0].tag() >= tags[1].tag())
+        {
+            return Err(D::Error::custom(format!(
+                "flexible tag ids must be strictly increasing: prior={}, current={}",
+                tags[0].tag(),
+                tags[1].tag()
+            )));
         }
-
-        debug!("deserializer={}", type_name_of_val(&deserializer));
-        deserializer.deserialize_seq(V)
+        Ok(TagBuffer(wire.fields))
     }
 }
 
