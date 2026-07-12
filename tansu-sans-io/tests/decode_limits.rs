@@ -14,12 +14,42 @@
 
 use bytes::Bytes;
 use tansu_sans_io::{
-    ApiKey as _, DecodeLimit, DecodeLimits, Error, Frame, Header, MetadataRequest, ProduceRequest,
-    SaslAuthenticateRequest, SaslHandshakeRequest,
+    ApiKey as _, ApiVersionsRequest, DecodeLimit, DecodeLimits, Error, Frame, Header,
+    MetadataRequest, ProduceRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
     metadata_request::MetadataRequestTopic,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
 };
+
+fn append_unsigned_varint(encoded: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        encoded.push(u8::try_from(value & 0x7f).unwrap() | 0x80);
+        value >>= 7;
+    }
+    encoded.push(u8::try_from(value).unwrap());
+}
+
+fn api_versions_with_header_tags(tags: &[(u32, Vec<u8>)]) -> Bytes {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&ApiVersionsRequest::KEY.to_be_bytes());
+    payload.extend_from_slice(&3i16.to_be_bytes());
+    payload.extend_from_slice(&42i32.to_be_bytes());
+    payload.extend_from_slice(&(-1i16).to_be_bytes());
+    append_unsigned_varint(&mut payload, u32::try_from(tags.len()).unwrap());
+    for (tag, data) in tags {
+        append_unsigned_varint(&mut payload, *tag);
+        append_unsigned_varint(&mut payload, u32::try_from(data.len()).unwrap());
+        payload.extend_from_slice(data);
+    }
+    payload.extend_from_slice(&[5, b'r', b'o', b'm', b'e']);
+    payload.extend_from_slice(&[2, b'1']);
+    payload.push(0);
+
+    let mut frame = Vec::with_capacity(payload.len() + std::mem::size_of::<i32>());
+    frame.extend_from_slice(&i32::try_from(payload.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame.into()
+}
 
 fn header(api_key: i16, api_version: i16) -> Header {
     Header::Request {
@@ -282,6 +312,75 @@ fn flexible_lengths_obey_the_same_limits() -> tansu_sans_io::Result<()> {
         DecodeLimit::Bytes,
     );
     Ok(())
+}
+
+#[test]
+fn flexible_tag_counts_and_payloads_use_caller_limits_before_allocation() {
+    let payload = vec![0x5a; 129];
+    let encoded = api_versions_with_header_tags(&[(1, payload)]);
+
+    assert_limit(
+        Frame::request_from_bytes_with_limits(
+            &encoded[..],
+            DecodeLimits {
+                max_bytes: 128,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap_err(),
+        DecodeLimit::Bytes,
+    );
+    assert!(
+        Frame::request_from_bytes_with_limits(
+            &encoded[..],
+            DecodeLimits {
+                max_bytes: 129,
+                ..DecodeLimits::default()
+            }
+        )
+        .is_ok(),
+        "the previous unrelated 128-byte tag cap must not reject a bounded valid payload"
+    );
+
+    let encoded = api_versions_with_header_tags(&[(1, vec![]), (2, vec![])]);
+    assert_limit(
+        Frame::request_from_bytes_with_limits(
+            &encoded[..],
+            DecodeLimits {
+                max_sequence_elements: 1,
+                ..DecodeLimits::default()
+            },
+        )
+        .unwrap_err(),
+        DecodeLimit::SequenceElements,
+    );
+    assert!(
+        Frame::request_from_bytes_with_limits(
+            &encoded[..],
+            DecodeLimits {
+                max_sequence_elements: 2,
+                ..DecodeLimits::default()
+            }
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn flexible_tag_ids_must_be_strictly_increasing() {
+    for tags in [[(1, vec![]), (1, vec![])], [(2, vec![]), (1, vec![])]] {
+        let error = Frame::request_from_bytes_with_limits(
+            &api_versions_with_header_tags(&tags)[..],
+            DecodeLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("flexible tag ids must be strictly increasing"),
+            "unexpected error: {error:?}"
+        );
+    }
 }
 
 #[test]
