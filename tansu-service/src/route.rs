@@ -51,6 +51,27 @@ impl RequestDecodeLimits {
         self.0
     }
 }
+
+/// Caller-supplied ceiling for one complete encoded Kafka response frame.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResponseWireLimit(usize);
+
+impl ResponseWireLimit {
+    /// Create a response ceiling including Kafka's four-byte length prefix.
+    pub fn new(maximum_frame_bytes: usize) -> Result<Self, Error> {
+        if maximum_frame_bytes < size_of::<i32>() {
+            return Err(Error::Message(
+                "response wire limit must accommodate the Kafka frame prefix".into(),
+            ));
+        }
+        Ok(Self(maximum_frame_bytes))
+    }
+
+    /// Return the maximum complete response-frame bytes.
+    pub fn maximum_frame_bytes(self) -> usize {
+        self.0
+    }
+}
 /// Whether a route is callable before the connection has a verified identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RouteAuthentication {
@@ -415,7 +436,7 @@ where
 impl<State, E, L> AdmittedRouteService<State, E, L>
 where
     State: Clone + Send + Sync + 'static,
-    E: std::error::Error + From<Error> + Send + Sync + 'static,
+    E: std::error::Error + From<Error> + From<tansu_sans_io::Error> + Send + Sync + 'static,
     L: Send + 'static,
 {
     async fn serve_admitted(
@@ -424,12 +445,24 @@ where
         request: AdmittedFrame<L, Bytes>,
     ) -> Result<AdmittedReply<L, Reply>, E> {
         let metadata = self.metadata(request.head()).map_err(E::from)?;
-        self.routes
+        let wire_limit = ctx.get::<ResponseWireLimit>().copied();
+        let reply = self
+            .routes
             .get(&metadata.api_key)
             .expect("route metadata came from the same immutable registry")
             .service
             .serve(ctx, request)
-            .await
+            .await?;
+        if let (Some(limit), Reply::Frame(frame)) = (wire_limit, reply.payload())
+            && frame.len() > limit.maximum_frame_bytes()
+        {
+            return Err(tansu_sans_io::Error::ResponseWireLimitExceeded {
+                required: frame.len(),
+                limit: limit.maximum_frame_bytes(),
+            }
+            .into());
+        }
+        Ok(reply)
     }
 }
 
@@ -570,17 +603,22 @@ where
             .into());
         }
         let no_response = matches!(&frame.body, Body::ProduceRequest(produce) if produce.acks == 0);
+        let maximum_wire_bytes = ctx
+            .get::<ResponseWireLimit>()
+            .copied()
+            .map_or(usize::MAX, ResponseWireLimit::maximum_frame_bytes);
         let response = self.service.serve(ctx, frame).await;
         if no_response {
             return Ok(request.reply(Reply::NoResponse));
         }
         let Frame { body, .. } = response?;
         let encoded = tokio::task::spawn_blocking(move || {
-            Frame::response(
+            Frame::response_with_limit(
                 Header::Response { correlation_id },
                 body,
                 api_key,
                 api_version,
+                maximum_wire_bytes,
             )
         })
         .await??;

@@ -271,8 +271,8 @@ pub use frame::{
 };
 pub use route::{
     AdmittedConnectionRouteService, AdmittedRouteBuilder, AdmittedRouteService,
-    RequestDecodeLimits, RouteAdmissionClass, RouteAuthentication, RouteDecodeStrategy,
-    RouteMetadata, RouteSession,
+    RequestDecodeLimits, ResponseWireLimit, RouteAdmissionClass, RouteAuthentication,
+    RouteDecodeStrategy, RouteMetadata, RouteSession,
 };
 
 pub use stream::{
