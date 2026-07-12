@@ -1548,12 +1548,23 @@ fn borrowed_field_accessor(field: &Field, parent: Option<&Field>, root: bool) ->
                 }
             }
             "records" => {
+                let bytes_ident = syn::parse_str::<syn::Ident>(&format!("{ident}_bytes"))
+                    .unwrap_or_else(|_| panic!("raw records accessor for {ident}"));
                 let repeated_crc = format!(
                     "{} Repeated calls validate the borrowed record-set CRCs again because the O(1) envelope intentionally retains no peer-cardinality-sized proof table.",
                     about
                 );
+                let opaque = format!(
+                    "Borrow the opaque {} bytes without validating record-batch structure or CRCs. Null and empty remain distinct. Call `{ident}()` to cross the single record-set validation boundary.",
+                    field.name()
+                );
                 if optional {
                     quote! {
+                        #[doc = #opaque]
+                        pub fn #bytes_ident(&self) -> Option<&[u8]> {
+                            self.#ident.as_ref().map(|range| &#bytes[range.clone()])
+                        }
+
                         #[doc = #repeated_crc]
                         pub fn #ident(&self) -> crate::Result<Option<crate::record::borrowed::RecordSet<'_>>> {
                             self.#ident
@@ -1567,6 +1578,11 @@ fn borrowed_field_accessor(field: &Field, parent: Option<&Field>, root: bool) ->
                     }
                 } else {
                     quote! {
+                        #[doc = #opaque]
+                        pub fn #bytes_ident(&self) -> &[u8] {
+                            &#bytes[self.#ident.as_ref().expect(#invariant).clone()]
+                        }
+
                         #[doc = #repeated_crc]
                         pub fn #ident(&self) -> crate::Result<crate::record::borrowed::RecordSet<'_>> {
                             crate::record::borrowed::RecordSet::from_bytes_with_limits(
@@ -1839,7 +1855,10 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
             impl #borrowed {
                 /// Decode one exact frame with [`crate::DecodeLimits::default`].
                 pub fn from_bytes(frame: bytes::Bytes) -> crate::Result<Self> {
-                    Self::from_bytes_with_limits(frame, crate::DecodeLimits::default())
+                    Self::from_bytes_with_options(
+                        frame,
+                        crate::BorrowedRequestDecodeOptions::default(),
+                    )
                 }
 
                 /// Decode one exact frame under explicit structural and record-batch limits.
@@ -1847,6 +1866,24 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                     frame: bytes::Bytes,
                     limits: crate::DecodeLimits,
                 ) -> crate::Result<Self> {
+                    Self::from_bytes_with_options(
+                        frame,
+                        crate::BorrowedRequestDecodeOptions {
+                            limits,
+                            ..crate::BorrowedRequestDecodeOptions::default()
+                        },
+                    )
+                }
+
+                /// Decode one exact frame under explicit limits and record-set validation timing.
+                ///
+                /// This is the sole generated implementation path. Existing constructors select
+                /// eager validation, preserving their fail-fast behavior and resource semantics.
+                pub fn from_bytes_with_options(
+                    frame: bytes::Bytes,
+                    options: crate::BorrowedRequestDecodeOptions,
+                ) -> crate::Result<Self> {
+                    let limits = options.limits;
                     limits.validate()?;
                     if SCHEMA_NESTING_DEPTH > limits.max_nesting_depth {
                         return Err(crate::Error::DecodeLimitExceeded {
@@ -1857,7 +1894,7 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                     }
                     let (head, mut cursor) = crate::borrowed::Cursor::request(
                         &frame,
-                        limits,
+                        options,
                         API_KEY,
                         MIN_VERSION,
                         MAX_VERSION,

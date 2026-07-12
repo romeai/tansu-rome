@@ -14,10 +14,10 @@
 
 use bytes::{Bytes, BytesMut};
 use tansu_sans_io::{
-    ApiKey as _, BorrowedProduceRequest, DecodeLimit, DecodeLimits, Error, Frame, Header,
-    ProduceRequest,
+    ApiKey as _, BorrowedProduceRequest, BorrowedRequestDecodeOptions, DecodeLimit, DecodeLimits,
+    Error, Frame, Header, ProduceRequest, RecordSetValidation,
     produce_request::{PartitionProduceData, TopicProduceData},
-    record::{Record, deflated, inflated},
+    record::{Record, borrowed::RecordSetError, deflated, inflated},
 };
 
 fn record_batch() -> tansu_sans_io::Result<deflated::Batch> {
@@ -153,14 +153,21 @@ fn nullable_records_preserve_null_and_empty_in_both_encodings() -> tansu_sans_io
         let mut partitions = topic.partition_data();
 
         let null = partitions.next().expect("null records")?;
+        assert!(null.records_bytes().is_none());
         assert!(null.records()?.is_none());
 
         let empty = partitions.next().expect("empty records")?;
+        assert_eq!(Some(&[][..]), empty.records_bytes());
         let empty = empty.records()?.expect("Some(empty)");
         assert!(empty.as_bytes().is_empty());
         assert_eq!(0, empty.batch_count());
 
         let populated = partitions.next().expect("populated records")?;
+        assert!(
+            populated
+                .records_bytes()
+                .is_some_and(|records| !records.is_empty())
+        );
         let populated = populated.records()?.expect("one batch");
         assert_eq!(1, populated.batch_count());
     }
@@ -322,8 +329,17 @@ fn peer_counts_and_request_wide_batch_work_are_bounded() -> tansu_sans_io::Resul
 }
 
 #[test]
-fn corrupt_record_batch_is_rejected_during_initial_request_validation() -> tansu_sans_io::Result<()>
-{
+fn eager_defaults_reject_corrupt_records_without_changing_the_api_surface()
+-> tansu_sans_io::Result<()> {
+    assert_eq!(
+        BorrowedRequestDecodeOptions::default(),
+        BorrowedRequestDecodeOptions {
+            limits: DecodeLimits::default(),
+            record_sets: RecordSetValidation::Eager,
+        }
+    );
+    assert_eq!(ProduceRequest::KEY, BorrowedProduceRequest::KEY);
+
     let encoded = encoded_request(
         9,
         [topic(
@@ -345,7 +361,65 @@ fn corrupt_record_batch_is_rejected_during_initial_request_validation() -> tansu
 
     let mut corrupt = BytesMut::from(&encoded[..]);
     corrupt[last_batch_byte] ^= 1;
-    let error = BorrowedProduceRequest::from_bytes(corrupt.freeze()).expect_err("CRC mismatch");
-    assert!(error.to_string().contains("CRC mismatch"));
+    let corrupt = corrupt.freeze();
+    for error in [
+        BorrowedProduceRequest::from_bytes(corrupt.clone()).expect_err("default eager CRC"),
+        BorrowedProduceRequest::from_bytes_with_options(
+            corrupt,
+            BorrowedRequestDecodeOptions {
+                limits: DecodeLimits::default(),
+                record_sets: RecordSetValidation::Eager,
+            },
+        )
+        .expect_err("explicit eager CRC"),
+    ] {
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::CrcMismatch { .. })
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn on_access_defers_corrupt_record_validation_to_the_partition_accessor()
+-> tansu_sans_io::Result<()> {
+    let encoded = encoded_request(
+        9,
+        [topic(
+            "events",
+            [PartitionProduceData::default()
+                .index(0)
+                .records(Some(deflated::Frame {
+                    batches: vec![record_batch()?],
+                }))],
+        )],
+    )?;
+    let eager = BorrowedProduceRequest::from_bytes(encoded.clone())?;
+    let topic = eager.topic_data().next().expect("topic")?;
+    let partition = topic.partition_data().next().expect("partition")?;
+    let records = partition.records()?.expect("records");
+    let batch = records.batches().next().expect("batch");
+    let batch_offset = batch.as_bytes().as_ptr() as usize - encoded.as_ptr() as usize;
+    let last_batch_byte = batch_offset + batch.as_bytes().len() - 1;
+
+    let mut corrupt = BytesMut::from(&encoded[..]);
+    corrupt[last_batch_byte] ^= 1;
+    let request = BorrowedProduceRequest::from_bytes_with_options(
+        corrupt.freeze(),
+        BorrowedRequestDecodeOptions {
+            limits: DecodeLimits::default(),
+            record_sets: RecordSetValidation::OnAccess,
+        },
+    )?;
+    let topic = request.topic_data().next().expect("topic")?;
+    assert_eq!("events", topic.name()?);
+    let partition = topic.partition_data().next().expect("partition")?;
+    let opaque = partition.records_bytes().expect("opaque records");
+    assert!(!opaque.is_empty());
+    assert!(matches!(
+        partition.records(),
+        Err(Error::RecordSet(RecordSetError::CrcMismatch { .. }))
+    ));
     Ok(())
 }
