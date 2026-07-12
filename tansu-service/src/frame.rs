@@ -15,10 +15,10 @@
 use std::{
     fmt::{self, Debug},
     marker::PhantomData,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
-use bytes::{BufMut as _, Bytes, BytesMut};
+use bytes::Bytes;
 use indicatif::ProgressBar;
 use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service, context::Extensions, matcher::Matcher, service::BoxService};
@@ -26,7 +26,7 @@ use rsasl::config::SASLConfig;
 use tansu_auth::{Authentication, SaslLimits};
 use tansu_sans_io::{
     ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, Response, RootMessageMeta,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslAuthenticateRequest, SaslHandshakeRequest,
 };
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
@@ -247,7 +247,6 @@ impl<S> Layer<S> for BytesFrameLayer {
                         sasl_config,
                         self.sasl_limits,
                     ),
-                    v0: Arc::new(Mutex::new(None)),
                 }),
         }
     }
@@ -256,13 +255,6 @@ impl<S> Layer<S> for BytesFrameLayer {
 #[derive(Clone)]
 struct AuthenticationFrame {
     authentication: Authentication,
-    v0: Arc<Mutex<Option<bool>>>,
-}
-
-impl AuthenticationFrame {
-    fn is_authenticated(&self) -> bool {
-        self.authentication.is_authenticated()
-    }
 }
 
 /// A [`Service`] transforming [`Bytes`]s into [`Frame`]s
@@ -308,38 +300,8 @@ where
         mut ctx: Context<State>,
         req: Bytes,
     ) -> Result<Self::Response, Self::Error> {
-        let sasl_handshake_v0 = self
-            .af
-            .as_ref()
-            .and_then(|af| af.v0.lock().ok())
-            .inspect(|v0| debug!(?v0))
-            .map(|v0| v0.unwrap_or_default())
-            .unwrap_or_default();
-
-        debug!(request_length = req.len(), sasl_handshake_v0);
-
-        let req = if sasl_handshake_v0 {
-            //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
-            //  corresponding to the mechanism are sent as opaque packets without wrapping the
-            //  messages with Kafka protocol headers. If SaslHandshakeRequest version is v1,
-            //  the SaslAuthenticate request/response are used, where the actual SASL tokens
-            //  are wrapped in the Kafka protocol. The error code in the final message from
-            //  the broker will indicate if authentication succeeded or failed.
-            Frame {
-                size: 0,
-                header: Header::Request {
-                    api_key: SaslAuthenticateRequest::KEY,
-                    api_version: 0,
-                    correlation_id: 0,
-                    client_id: None,
-                },
-                body: Body::SaslAuthenticateRequest(
-                    SaslAuthenticateRequest::default().auth_bytes(req.slice(4..)),
-                ),
-            }
-        } else {
-            spawn_blocking(|| Frame::request_from_bytes(req)).await??
-        };
+        debug!(request_length = req.len());
+        let req = spawn_blocking(|| Frame::request_from_bytes(req)).await??;
 
         let api_key = req.api_key()?;
 
@@ -370,64 +332,24 @@ where
             self.inner.serve(ctx, req).await?
         };
 
-        if sasl_handshake_v0 {
-            //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
-            //  corresponding to the mechanism are sent as opaque packets without wrapping the
-            //  messages with Kafka protocol headers.
-
-            // when authenticated, this is final handshake:
-            if let Some(af) = self.af.as_ref()
-                && af.is_authenticated()
-                && let Ok(mut v0) = af.v0.lock()
-                && v0.is_some()
-            {
-                *v0 = None
-            }
-
-            SaslAuthenticateResponse::try_from(body)
-                .and_then(|response| {
-                    i32::try_from(response.auth_bytes.len())
-                        .map_err(Into::into)
-                        .map(|size| {
-                            let mut frame = BytesMut::new();
-                            frame.put(&size.to_be_bytes()[..]);
-                            frame.put(response.auth_bytes);
-                            Bytes::from(frame)
-                        })
-                })
-                .map_err(Into::into)
-        } else {
-            //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
-            //  corresponding to the mechanism are sent as opaque packets without wrapping the
-            //  messages with Kafka protocol headers.
-            //
-            // Following messages will be opaque:
-            if let Some(af) = self.af.as_ref()
-                && (api_key == SaslHandshakeRequest::KEY && api_version == 0)
-                && let Ok(mut v0) = af.v0.lock()
-            {
-                *v0 = Some(true)
-            }
-
-            spawn_blocking(move || {
-                Frame::response(
-                    Header::Response { correlation_id },
-                    body,
-                    api_key,
-                    api_version,
-                )
-            })
-            .await?
-            .inspect(|response| {
-                debug!(response_length = response.len());
-                API_REQUESTS.add(1, &attributes);
-            })
-            .inspect_err(|err| {
-                error!(api_key, api_version, ?err);
-                API_ERRORS.add(1, &attributes);
-            })
-            .map_err(Into::into)
-        }
+        spawn_blocking(move || {
+            Frame::response(
+                Header::Response { correlation_id },
+                body,
+                api_key,
+                api_version,
+            )
+        })
+        .await?
+        .inspect(|response| {
+            debug!(response_length = response.len());
+            API_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|err| {
+            error!(api_key, api_version, ?err);
+            API_ERRORS.add(1, &attributes);
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -447,35 +369,11 @@ where
         mut ctx: Context<State>,
         req: AdmittedFrame<L, Bytes>,
     ) -> Result<Self::Response, Self::Error> {
-        let sasl_handshake_v0 = self
-            .af
-            .as_ref()
-            .and_then(|af| af.v0.lock().ok())
-            .inspect(|v0| debug!(?v0))
-            .map(|v0| v0.unwrap_or_default())
-            .unwrap_or_default();
-
-        debug!(request = ?&req.payload[..], sasl_handshake_v0);
-
-        let frame = if sasl_handshake_v0 {
-            Frame {
-                size: 0,
-                header: Header::Request {
-                    api_key: SaslAuthenticateRequest::KEY,
-                    api_version: 0,
-                    correlation_id: 0,
-                    client_id: None,
-                },
-                body: Body::SaslAuthenticateRequest(
-                    SaslAuthenticateRequest::default().auth_bytes(req.payload.slice(4..)),
-                ),
-            }
-        } else {
-            let encoded = req.payload.clone();
-            spawn_blocking(|| Frame::request_from_bytes(encoded))
-                .await?
-                .inspect(|request| debug!(?request))?
-        };
+        debug!(request = ?&req.payload[..]);
+        let encoded = req.payload.clone();
+        let frame = spawn_blocking(|| Frame::request_from_bytes(encoded))
+            .await?
+            .inspect(|request| debug!(?request))?;
 
         let api_key = frame.api_key()?;
         if !self.is_authenticated(api_key) {
@@ -484,10 +382,9 @@ where
 
         let api_version = frame.api_version()?;
         let correlation_id = frame.correlation_id()?;
-        if !sasl_handshake_v0
-            && (req.head.api_key() != api_key
-                || req.head.api_version() != api_version
-                || req.head.correlation_id() != correlation_id)
+        if req.head.api_key() != api_key
+            || req.head.api_version() != api_version
+            || req.head.correlation_id() != correlation_id
         {
             return Err(Into::into(tansu_sans_io::Error::Message(
                 "decoded request identity differs from its admitted head".into(),
@@ -527,53 +424,23 @@ where
 
         let Frame { body, .. } = response.inspect(|response| debug!(?response))?;
 
-        let payload = if sasl_handshake_v0 {
-            if let Some(af) = self.af.as_ref()
-                && af.is_authenticated()
-                && let Ok(mut v0) = af.v0.lock()
-                && v0.is_some()
-            {
-                *v0 = None
-            }
-
-            SaslAuthenticateResponse::try_from(body)
-                .and_then(|response| {
-                    i32::try_from(response.auth_bytes.len())
-                        .map_err(Into::into)
-                        .map(|size| {
-                            let mut frame = BytesMut::new();
-                            frame.put(&size.to_be_bytes()[..]);
-                            frame.put(response.auth_bytes);
-                            Bytes::from(frame)
-                        })
-                })
-                .map_err(S::Error::from)?
-        } else {
-            if let Some(af) = self.af.as_ref()
-                && (api_key == SaslHandshakeRequest::KEY && api_version == 0)
-                && let Ok(mut v0) = af.v0.lock()
-            {
-                *v0 = Some(true)
-            }
-
-            spawn_blocking(move || {
-                Frame::response(
-                    Header::Response { correlation_id },
-                    body,
-                    api_key,
-                    api_version,
-                )
-            })
-            .await?
-            .inspect(|response| {
-                debug!(response = ?response[..]);
-                API_REQUESTS.add(1, &attributes);
-            })
-            .inspect_err(|err| {
-                error!(api_key, api_version, ?err);
-                API_ERRORS.add(1, &attributes);
-            })?
-        };
+        let payload = spawn_blocking(move || {
+            Frame::response(
+                Header::Response { correlation_id },
+                body,
+                api_key,
+                api_version,
+            )
+        })
+        .await?
+        .inspect(|response| {
+            debug!(response = ?response[..]);
+            API_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|err| {
+            error!(api_key, api_version, ?err);
+            API_ERRORS.add(1, &attributes);
+        })?;
 
         Ok(AdmittedReply {
             head,
@@ -977,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn bytes_frame_layer_creates_fresh_authentication_per_service() {
+    fn bytes_frame_layer_configures_authentication_per_service() {
         let sasl_config =
             SASLConfig::with_credentials(None, "principal".to_owned(), "password".to_owned())
                 .expect("SASL configuration");
@@ -988,7 +855,8 @@ mod tests {
 
         let first = first.af.expect("authentication state");
         let second = second.af.expect("authentication state");
-        assert!(!std::sync::Arc::ptr_eq(&first.v0, &second.v0));
+        assert!(!first.authentication.is_authenticated());
+        assert!(!second.authentication.is_authenticated());
     }
 
     #[test]

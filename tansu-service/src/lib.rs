@@ -279,11 +279,11 @@ pub use stream::{
     AcceptIntent, AdmissionDisconnect, AdmissionDisconnectMonitor, AdmissionEvidence,
     AdmissionLease, AdmittedFrame, AdmittedReply, AdmittedTcpBytesLayer, AdmittedTcpBytesService,
     BytesLayer, BytesService, BytesTcpService, CloneConnectionService, ConnectionInfo,
-    FixedConnectionLease, FixedConnectionPolicy, NoopAdmissionDisconnectMonitor, ProtocolIoPhase,
-    Reply, RequestAdmissionError, RequestHead, TcpAdmissionDisconnectMonitor, TcpBytesLayer,
-    TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpKeepaliveConfig,
-    TcpListenerError, TcpListenerLayer, TcpListenerService, TcpTransportConfig,
-    TcpTransportConfigError,
+    FixedConnectionLease, FixedConnectionPolicy, NoopAdmissionDisconnectMonitor, OpaqueSaslV0Reply,
+    ProtocolIoPhase, Reply, RequestAdmissionError, RequestHead, RequestPrelude,
+    TcpAdmissionDisconnectMonitor, TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer,
+    TcpContextService, TcpKeepaliveConfig, TcpListenerError, TcpListenerLayer, TcpListenerService,
+    TcpTransportConfig, TcpTransportConfigError,
 };
 
 #[derive(Clone, Debug, thiserror::Error)]

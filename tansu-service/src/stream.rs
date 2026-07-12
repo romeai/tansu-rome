@@ -43,7 +43,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 
-use crate::{BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE};
+use crate::{
+    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, RouteSession,
+    route::OpaqueSaslV0Outcome,
+};
 
 /// Bytes occupied by Kafka's signed frame-length prefix.
 const FRAME_LENGTH_PREFIX_BYTES: usize = size_of::<i32>();
@@ -119,6 +122,37 @@ impl FrameLength {
             })
         } else {
             Ok(self)
+        }
+    }
+}
+
+/// The allocation-free framing information available before body admission.
+///
+/// Kafka requests expose their fixed routing head. SASL handshake version zero
+/// tokens expose only their bounded length because their payload has no Kafka
+/// API key, version, correlation ID, or request-header grammar.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RequestPrelude {
+    /// An ordinary Kafka request selected by its fixed head.
+    Kafka(RequestHead),
+    /// A length-prefixed token in a connection-local SASL v0 exchange.
+    OpaqueSaslV0 { body_len: usize },
+}
+
+impl RequestPrelude {
+    /// Return the declared body length excluding the signed prefix.
+    pub fn body_len(self) -> usize {
+        match self {
+            Self::Kafka(head) => head.body_len(),
+            Self::OpaqueSaslV0 { body_len } => body_len,
+        }
+    }
+
+    /// Return a Kafka head when this prelude uses Kafka framing.
+    pub fn kafka_head(self) -> Option<RequestHead> {
+        match self {
+            Self::Kafka(head) => Some(head),
+            Self::OpaqueSaslV0 { .. } => None,
         }
     }
 }
@@ -278,8 +312,35 @@ pub enum Reply {
     /// Write one complete length-prefixed Kafka response frame.
     Frame(Bytes),
 
+    /// Write one complete opaque SASL-v0 token packet.
+    OpaqueSaslV0(OpaqueSaslV0Reply),
+
     /// Complete the request without writing protocol bytes.
     NoResponse,
+}
+
+/// A complete bounded SASL-v0 token packet constructed by the transport.
+///
+/// Its private field prevents Kafka route handlers from mislabelling a Kafka
+/// response as an opaque packet. The enclosing admitted reply retains the
+/// request lease through the transport's write and flush.
+///
+/// ```compile_fail
+/// # use bytes::Bytes;
+/// # use tansu_service::OpaqueSaslV0Reply;
+/// let forged = OpaqueSaslV0Reply(Bytes::new());
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpaqueSaslV0Reply(Bytes);
+
+impl OpaqueSaslV0Reply {
+    fn new(payload: Bytes) -> Self {
+        Self(payload)
+    }
+
+    fn payload(&self) -> &Bytes {
+        &self.0
+    }
 }
 
 impl<L, T> AdmittedReply<L, T> {
@@ -365,6 +426,10 @@ where
     /// The admitted request service failed fatally.
     #[error("admitted request service failed")]
     Service(#[source] S),
+
+    /// A terminal SASL-v0 exchange failed after any bounded final token was flushed.
+    #[error("opaque SASL v0 authentication failed")]
+    OpaqueSaslV0Failed,
 }
 
 /// A non-consuming peer disconnect observed while admission was pending.
@@ -468,6 +533,8 @@ impl AdmissionDisconnectMonitor<TcpStream> for TcpAdmissionDisconnectMonitor {
 pub enum ProtocolIoPhase {
     /// The eight fixed request-header bytes after the length prefix.
     FixedRequestHeader,
+    /// The admitted token body in a headerless SASL handshake v0 exchange.
+    OpaqueSaslV0Token,
     /// The admitted request body following the twelve-byte request head.
     RequestBody,
     /// Writing and flushing one complete protocol response.
@@ -478,6 +545,7 @@ impl std::fmt::Display for ProtocolIoPhase {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let description = match self {
             Self::FixedRequestHeader => "fixed request header read",
+            Self::OpaqueSaslV0Token => "opaque SASL v0 token read",
             Self::RequestBody => "request body read",
             Self::ResponseWrite => "response write and flush",
         };
@@ -676,6 +744,7 @@ pub struct TcpTransportConfig {
     keepalive: Option<TcpKeepaliveConfig>,
     idle_timeout: Option<Duration>,
     request_head_timeout: Option<Duration>,
+    opaque_sasl_token_timeout: Option<Duration>,
     body_read_timeout: Option<Duration>,
     response_write_timeout: Option<Duration>,
 }
@@ -740,6 +809,20 @@ impl TcpTransportConfig {
         Ok(self)
     }
 
+    /// Bound reading an admitted opaque SASL handshake v0 token.
+    ///
+    /// Admission waits do not spend this peer-I/O budget. Opaque tokens have
+    /// no Kafka fixed head or request body, so their clock remains distinct
+    /// from both phases of ordinary Kafka request framing.
+    pub fn with_opaque_sasl_token_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, TcpTransportConfigError> {
+        self.opaque_sasl_token_timeout =
+            Some(checked_duration("opaque SASL v0 token read", timeout)?);
+        Ok(self)
+    }
+
     /// Bound reading a request body after its fixed header has been validated.
     ///
     /// In the admitted runtime this clock begins only after the request policy
@@ -790,6 +873,11 @@ impl TcpTransportConfig {
     /// Return the deadline for the fixed request header after its length prefix.
     pub fn request_head_timeout(&self) -> Option<Duration> {
         self.request_head_timeout
+    }
+
+    /// Return the deadline for an admitted opaque SASL-v0 token body.
+    pub fn opaque_sasl_token_timeout(&self) -> Option<Duration> {
+        self.opaque_sasl_token_timeout
     }
 
     /// Return the deadline for reading a validated request body.
@@ -1557,6 +1645,7 @@ impl<S, State> TcpBytesService<S, State> {
 pub struct AdmittedTcpBytesLayer<State, P, M = NoopAdmissionDisconnectMonitor> {
     policy: P,
     disconnect_monitor: M,
+    route_session: Option<RouteSession>,
     _state: PhantomData<State>,
 }
 
@@ -1566,6 +1655,7 @@ impl<State, P> AdmittedTcpBytesLayer<State, P> {
         Self {
             policy,
             disconnect_monitor: NoopAdmissionDisconnectMonitor,
+            route_session: None,
             _state: PhantomData,
         }
     }
@@ -1580,8 +1670,20 @@ impl<State, P, M> AdmittedTcpBytesLayer<State, P, M> {
         AdmittedTcpBytesLayer {
             policy: self.policy,
             disconnect_monitor,
+            route_session: self.route_session,
             _state: PhantomData,
         }
+    }
+
+    /// Use the same fresh connection session as the admitted route service.
+    ///
+    /// The route registry is immutable process state, while framing and SASL
+    /// identity are mutable socket state. Supplying one clone to both layers
+    /// lets a successful v0 handshake select opaque framing without sharing an
+    /// authentication transcript with another connection.
+    pub fn with_route_session(mut self, route_session: RouteSession) -> Self {
+        self.route_session = Some(route_session);
+        self
     }
 }
 
@@ -1597,6 +1699,7 @@ where
             inner,
             policy: self.policy.clone(),
             disconnect_monitor: self.disconnect_monitor.clone(),
+            route_session: self.route_session.clone(),
             _state: PhantomData,
         }
     }
@@ -1608,6 +1711,7 @@ pub struct AdmittedTcpBytesService<S, State, P, M = NoopAdmissionDisconnectMonit
     inner: S,
     policy: P,
     disconnect_monitor: M,
+    route_session: Option<RouteSession>,
     _state: PhantomData<State>,
 }
 
@@ -1626,18 +1730,24 @@ enum ReadHeadError {
     },
 }
 
+#[derive(Clone, Copy)]
+enum EncodedPrelude {
+    Kafka([u8; REQUEST_HEAD_BYTES]),
+    OpaqueSaslV0([u8; FRAME_LENGTH_PREFIX_BYTES]),
+}
+
 impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
-    async fn read_head<R>(
+    async fn read_prelude<R>(
         &self,
         stream: &mut R,
         maximum_frame_size: Option<usize>,
         transport: TcpTransportConfig,
-    ) -> Result<(RequestHead, FrameLength, [u8; REQUEST_HEAD_BYTES]), ReadHeadError>
+    ) -> Result<(RequestPrelude, FrameLength, EncodedPrelude), ReadHeadError>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut encoded = [0u8; REQUEST_HEAD_BYTES];
-        let read = stream.read_exact(&mut encoded[..FRAME_LENGTH_PREFIX_BYTES]);
+        let mut prefix = [0u8; FRAME_LENGTH_PREFIX_BYTES];
+        let read = stream.read_exact(&mut prefix);
         if let Some(timeout) = transport.idle_timeout() {
             _ = tokio::time::timeout(timeout, read)
                 .await
@@ -1646,13 +1756,35 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
             _ = read.await?;
         }
 
-        let length_prefix = encoded[..FRAME_LENGTH_PREFIX_BYTES]
-            .try_into()
-            .expect("the request head contains a complete length prefix");
-        // This error is converted by `request`; keeping I/O separate here
-        // makes it impossible to confuse a policy rejection with malformed
-        // wire input.
-        let length = FrameLength::request(length_prefix, maximum_frame_size)?;
+        let opaque_sasl_v0 = match &self.route_session {
+            Some(session) => session.expects_opaque_sasl_v0()?,
+            None => false,
+        };
+        if opaque_sasl_v0 {
+            let maximum_token_size = self
+                .route_session
+                .as_ref()
+                .and_then(RouteSession::maximum_sasl_token_size);
+            let maximum = match (maximum_frame_size, maximum_token_size) {
+                (Some(frame), Some(token)) => Some(frame.min(token)),
+                (frame, token) => frame.or(token),
+            };
+            let length = FrameLength::bounded(prefix, maximum)?;
+            return Ok((
+                RequestPrelude::OpaqueSaslV0 {
+                    body_len: length.body,
+                },
+                length,
+                EncodedPrelude::OpaqueSaslV0(prefix),
+            ));
+        }
+
+        // Kafka route and admission policy need the fixed identity before any
+        // complete-frame allocation. The exact bytes are retained and reused
+        // so policy selection does not introduce a second framing path.
+        let length = FrameLength::request(prefix, maximum_frame_size)?;
+        let mut encoded = [0u8; REQUEST_HEAD_BYTES];
+        encoded[..FRAME_LENGTH_PREFIX_BYTES].copy_from_slice(&prefix);
 
         let read = stream.read_exact(&mut encoded[FRAME_LENGTH_PREFIX_BYTES..]);
         if let Some(timeout) = transport.request_head_timeout() {
@@ -1666,16 +1798,20 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
             _ = read.await?;
         }
         let (head, _) = RequestHead::decode(encoded, maximum_frame_size)?;
-        Ok((head, length, encoded))
+        Ok((
+            RequestPrelude::Kafka(head),
+            length,
+            EncodedPrelude::Kafka(encoded),
+        ))
     }
 
     async fn admit(
         &self,
         mut ctx: Context<State>,
-        mut request: RequestHead,
-    ) -> Result<(Context<State>, RequestHead, P::Guard), P::Error>
+        mut request: RequestPrelude,
+    ) -> Result<(Context<State>, RequestPrelude, P::Guard), P::Error>
     where
-        P: Policy<State, RequestHead>,
+        P: Policy<State, RequestPrelude>,
         State: Clone + Send + Sync + 'static,
     {
         loop {
@@ -1700,15 +1836,15 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
     ) -> Result<(), RequestAdmissionError<P::Error, S::Error>>
     where
         S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard, Reply>>,
-        P: Policy<State, RequestHead>,
+        P: Policy<State, RequestPrelude>,
         P::Error: error::Error + 'static,
         S::Error: error::Error + 'static,
         State: Clone + Send + Sync + 'static,
         R: AsyncReadExt + AsyncWriteExt + Unpin,
         M: AdmissionDisconnectMonitor<R>,
     {
-        let (wire_head, length, encoded_head) = self
-            .read_head(stream, maximum_frame_size, transport)
+        let (wire_prelude, length, encoded_prelude) = self
+            .read_prelude(stream, maximum_frame_size, transport)
             .await
             .map_err(|error| match error {
                 ReadHeadError::Io(error) => RequestAdmissionError::Io(error),
@@ -1718,7 +1854,7 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
                 }
             })?;
         let admitted = {
-            let admission = self.admit(ctx, wire_head);
+            let admission = self.admit(ctx, wire_prelude);
             let disconnect = self.disconnect_monitor.disconnected(&*stream);
             tokio::pin!(admission, disconnect);
             tokio::select! {
@@ -1733,23 +1869,40 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
                 },
             }
         };
-        let (ctx, admitted_head, lease) = admitted;
+        let (ctx, admitted_prelude, lease) = admitted;
 
         // A Rama policy may carry a request through retries, but changing the
         // protocol identity would separate admission from the bytes it guards.
-        if admitted_head != wire_head {
+        if admitted_prelude != wire_prelude {
             return Err(RequestAdmissionError::Frame(Error::Message(
-                "request policy changed the Kafka request head".into(),
+                "request policy changed the protocol prelude".into(),
             )));
         }
 
         let mut request = vec![0u8; length.complete];
-        request[..REQUEST_HEAD_BYTES].copy_from_slice(&encoded_head);
-        let read = stream.read_exact(&mut request[REQUEST_HEAD_BYTES..]);
-        if let Some(timeout) = transport.body_read_timeout() {
+        let (prefix_length, read_timeout, read_phase) = match encoded_prelude {
+            EncodedPrelude::Kafka(encoded) => {
+                request[..REQUEST_HEAD_BYTES].copy_from_slice(&encoded);
+                (
+                    REQUEST_HEAD_BYTES,
+                    transport.body_read_timeout(),
+                    ProtocolIoPhase::RequestBody,
+                )
+            }
+            EncodedPrelude::OpaqueSaslV0(encoded) => {
+                request[..FRAME_LENGTH_PREFIX_BYTES].copy_from_slice(&encoded);
+                (
+                    FRAME_LENGTH_PREFIX_BYTES,
+                    transport.opaque_sasl_token_timeout(),
+                    ProtocolIoPhase::OpaqueSaslV0Token,
+                )
+            }
+        };
+        let read = stream.read_exact(&mut request[prefix_length..]);
+        if let Some(timeout) = read_timeout {
             _ = tokio::time::timeout(timeout, read).await.map_err(|_| {
                 RequestAdmissionError::Timeout {
-                    phase: ProtocolIoPhase::RequestBody,
+                    phase: read_phase,
                     timeout,
                 }
             })??;
@@ -1758,22 +1911,59 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
         }
         BYTES_RECEIVED.add(request.len() as u64, &[]);
 
-        let reply = self
-            .inner
-            .serve(
-                ctx,
-                AdmittedFrame {
-                    head: wire_head,
-                    payload: Bytes::from(request),
+        let (payload, lease, terminal_sasl_failure) = match wire_prelude {
+            RequestPrelude::Kafka(wire_head) => {
+                let reply = self
+                    .inner
+                    .serve(
+                        ctx,
+                        AdmittedFrame {
+                            head: wire_head,
+                            payload: Bytes::from(request),
+                            lease,
+                        },
+                    )
+                    .await
+                    .map_err(RequestAdmissionError::Service)?;
+                let AdmittedReply { payload, lease, .. } = reply;
+                (payload, lease, false)
+            }
+            RequestPrelude::OpaqueSaslV0 { .. } => {
+                let session = self.route_session.as_ref().ok_or_else(|| {
+                    RequestAdmissionError::Frame(Error::Message(
+                        "opaque SASL prelude requires a route session".into(),
+                    ))
+                })?;
+                let token = Bytes::from(request).slice(FRAME_LENGTH_PREFIX_BYTES..);
+                let (token, failed) = match session
+                    .authenticate_opaque_sasl_v0(ctx, token)
+                    .await
+                    .map_err(RequestAdmissionError::Frame)?
+                {
+                    OpaqueSaslV0Outcome::Continue(token)
+                    | OpaqueSaslV0Outcome::Authenticated(token) => (token, false),
+                    OpaqueSaslV0Outcome::Failed(token) => (token, true),
+                };
+                let declared = i32::try_from(token.len()).map_err(|_| {
+                    RequestAdmissionError::Frame(Error::FrameLengthOverflow { declared: i32::MAX })
+                })?;
+                let mut packet = Vec::with_capacity(FRAME_LENGTH_PREFIX_BYTES + token.len());
+                packet.extend_from_slice(&declared.to_be_bytes());
+                packet.extend_from_slice(&token);
+                (
+                    Reply::OpaqueSaslV0(OpaqueSaslV0Reply::new(Bytes::from(packet))),
                     lease,
-                },
-            )
-            .await
-            .map_err(RequestAdmissionError::Service)?;
-
-        let AdmittedReply { payload, lease, .. } = reply;
+                    failed,
+                )
+            }
+        };
         let _lease = lease;
-        if let Reply::Frame(payload) = payload {
+        let wire_payload = match &payload {
+            Reply::Frame(payload) => Some(payload),
+            Reply::OpaqueSaslV0(payload) => Some(payload.payload()),
+            Reply::NoResponse => None,
+        };
+        if let Some(payload) = wire_payload {
             let write = async {
                 stream.write_all(&payload).await?;
                 stream.flush().await
@@ -1790,6 +1980,9 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
             }
             BYTES_SENT.add(payload.len() as u64, &[]);
         }
+        if terminal_sasl_failure {
+            return Err(RequestAdmissionError::OpaqueSaslV0Failed);
+        }
         Ok(())
     }
 }
@@ -1797,7 +1990,7 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
 impl<S, State, P, M, Stream> Service<TcpContext, Stream> for AdmittedTcpBytesService<S, State, P, M>
 where
     S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard, Reply>>,
-    P: Policy<State, RequestHead>,
+    P: Policy<State, RequestPrelude>,
     P::Error: error::Error + 'static,
     S::Error: error::Error + 'static,
     State: Clone + Default + Send + Sync + 'static,
@@ -2110,7 +2303,7 @@ mod tests {
     use super::{
         AcceptIntent, AdmissionDisconnect, AdmissionDisconnectMonitor, AdmissionEvidence,
         AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo, FixedConnectionPolicy,
-        FrameLength, ProtocolIoPhase, Reply, RequestAdmissionError, RequestHead,
+        FrameLength, ProtocolIoPhase, Reply, RequestAdmissionError, RequestHead, RequestPrelude,
         SocketOptionTarget, TcpAdmissionDisconnectMonitor, TcpBytesLayer, TcpContext,
         TcpKeepaliveConfig, TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
         configure_admitted_socket,
@@ -2136,15 +2329,42 @@ mod tests {
         cancelled: Arc<AtomicUsize>,
     }
 
-    impl Policy<(), RequestHead> for PendingCancellationPolicy {
+    #[derive(Clone, Debug)]
+    struct OpaquePolicy {
+        started: mpsc::UnboundedSender<RequestPrelude>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Policy<(), RequestPrelude> for OpaquePolicy {
+        type Guard = RequestLease;
+        type Error = io::Error;
+
+        async fn check(
+            &self,
+            ctx: Context<()>,
+            request: RequestPrelude,
+        ) -> PolicyResult<(), RequestPrelude, Self::Guard, Self::Error> {
+            self.started.send(request).unwrap();
+            PolicyResult {
+                ctx,
+                request,
+                output: PolicyOutput::Ready(RequestLease {
+                    id: 0,
+                    drops: self.drops.clone(),
+                }),
+            }
+        }
+    }
+
+    impl Policy<(), RequestPrelude> for PendingCancellationPolicy {
         type Guard = RequestLease;
         type Error = io::Error;
 
         async fn check(
             &self,
             _ctx: Context<()>,
-            _request: RequestHead,
-        ) -> PolicyResult<(), RequestHead, Self::Guard, Self::Error> {
+            _request: RequestPrelude,
+        ) -> PolicyResult<(), RequestPrelude, Self::Guard, Self::Error> {
             let cancellation = DropProbe(self.cancelled.clone());
             self.started.send(()).unwrap();
             std::future::pending::<()>().await;
@@ -2255,16 +2475,19 @@ mod tests {
         }
     }
 
-    impl Policy<(), RequestHead> for RequestPolicy {
+    impl Policy<(), RequestPrelude> for RequestPolicy {
         type Guard = RequestLease;
         type Error = io::Error;
 
         async fn check(
             &self,
             ctx: Context<()>,
-            request: RequestHead,
-        ) -> PolicyResult<(), RequestHead, Self::Guard, Self::Error> {
-            self.started.send(request).unwrap();
+            request: RequestPrelude,
+        ) -> PolicyResult<(), RequestPrelude, Self::Guard, Self::Error> {
+            let head = request
+                .kafka_head()
+                .expect("this test policy admits Kafka requests only");
+            self.started.send(head).unwrap();
             let output = if self.abort {
                 PolicyOutput::Abort(io::Error::other("request denied"))
             } else {
@@ -2272,7 +2495,7 @@ mod tests {
                     Ok(permit) => {
                         permit.forget();
                         PolicyOutput::Ready(RequestLease {
-                            id: request.correlation_id() as usize,
+                            id: head.correlation_id() as usize,
                             drops: self.drops.clone(),
                         })
                     }
@@ -3077,6 +3300,95 @@ mod tests {
                 minimum: 8,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn opaque_sasl_prelude_does_not_read_a_kafka_head() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let session = crate::RouteSession::anonymous();
+        session.force_opaque_sasl_v0_for_transport_test();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(OpaquePolicy {
+                started: started_tx,
+                drops: drops.clone(),
+            })
+            .with_route_session(session)
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(16);
+        client.write_all(&1_i32.to_be_bytes()).await.unwrap();
+
+        let connection = tokio::spawn(async move {
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await
+        });
+        assert_eq!(
+            RequestPrelude::OpaqueSaslV0 { body_len: 1 },
+            timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+
+        // Admission is complete and the token read is waiting for its sole
+        // byte. A Kafka-head read would still require eight bytes and could
+        // not have reached the policy.
+        connection.abort();
+        assert!(connection.await.unwrap_err().is_cancelled());
+        assert_eq!(1, drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opaque_sasl_token_has_its_own_post_admission_deadline() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let session = crate::RouteSession::anonymous();
+        session.force_opaque_sasl_v0_for_transport_test();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(OpaquePolicy {
+                started: started_tx,
+                drops: drops.clone(),
+            })
+            .with_route_session(session)
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(16);
+        let timeout = Duration::from_secs(10);
+        let mut ctx = Context::with_state(TcpContext::default());
+        assert!(
+            ctx.insert(
+                TcpTransportConfig::default()
+                    .with_opaque_sasl_token_timeout(timeout)
+                    .unwrap()
+            )
+            .is_none()
+        );
+        client.write_all(&1_i32.to_be_bytes()).await.unwrap();
+
+        let connection = tokio::spawn(async move { service.serve(ctx, server).await });
+        assert_eq!(
+            RequestPrelude::OpaqueSaslV0 { body_len: 1 },
+            started_rx.recv().await.unwrap()
+        );
+        advance(Duration::from_secs(9)).await;
+        assert!(!connection.is_finished());
+        advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            connection.await.unwrap(),
+            Err(RequestAdmissionError::Timeout {
+                phase: ProtocolIoPhase::OpaqueSaslV0Token,
+                timeout: actual,
+            }) if actual == timeout
+        ));
+        assert_eq!(1, drops.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -44,14 +44,11 @@ where
                 .lock()
                 .map_err(Into::into)
                 .map(|mut guard| {
-                    // Re-authentication (KIP-368): a Java kafka-clients
-                    // connection periodically issues another SaslHandshake
-                    // on the same TCP socket. The previous handshake left
-                    // the Stage in `Session`/`Finished`, so a stale
-                    // `take()` would fall into the else branch and reject
-                    // a perfectly valid mechanism with
-                    // `UnsupportedSaslMechanism`. Always start with a
-                    // fresh `SASLServer` built from the stored config.
+                    // KIP-368 permits a connection to begin another handshake
+                    // after an active or completed exchange. Mechanism
+                    // negotiation therefore requires a fresh server stage;
+                    // retaining transcript state would reject a mechanism
+                    // solely because this socket authenticated before.
                     if guard
                         .as_ref()
                         .is_none_or(|guard| !matches!(guard, Stage::Server(_)))

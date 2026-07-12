@@ -211,12 +211,28 @@ impl Authentication {
         }
     }
 
+    /// Return the immutable resource bounds for this connection's exchange.
+    pub fn limits(&self) -> SaslLimits {
+        self.limits
+    }
+
     pub fn is_authenticated(&self) -> bool {
         self.stage
             .lock()
             .map(|guard| matches!(guard.as_ref(), Some(Stage::Finished(Ok(_)))))
             .ok()
             .unwrap_or_default()
+    }
+
+    /// Return whether a handshake has established an active SASL token exchange.
+    ///
+    /// This is distinct from authentication: a session may require several
+    /// peer and server tokens before its verifier supplies a positive identity.
+    pub fn is_exchanging(&self) -> Result<bool, Error> {
+        self.stage
+            .lock()
+            .map(|guard| matches!(guard.as_ref(), Some(Stage::Session(_))))
+            .map_err(Into::into)
     }
 
     /// Build a fresh `Stage::Server` from the stored config. Used by

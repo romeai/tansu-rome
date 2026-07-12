@@ -14,12 +14,16 @@
 
 //! Route metadata and services selected from an admitted Kafka request head.
 
-use std::{collections::BTreeMap, mem::size_of, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    mem::size_of,
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
 use rama::{Context, Service, service::BoxService};
 use rsasl::config::SASLConfig;
-use tansu_auth::{Authentication, SaslLimits};
+use tansu_auth::{Authentication, SaslAuthenticateService, SaslLimits};
 use tansu_sans_io::{
     ApiKey as _, ApiVersionsRequest, Body, DecodeLimits, Frame, Header, ProduceRequest,
     RootMessageMeta, SaslAuthenticateRequest, SaslHandshakeRequest,
@@ -172,6 +176,22 @@ pub struct AdmittedRouteService<State, E, L> {
 #[derive(Clone)]
 pub struct RouteSession {
     authentication: Option<Authentication>,
+    // Transport admission and route dispatch must observe one framing mode for
+    // this socket. The shared lock connects those layers without sharing the
+    // mutable transcript or identity with any other accepted connection.
+    framing: Arc<Mutex<ConnectionFraming>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionFraming {
+    Kafka,
+    OpaqueSaslV0,
+}
+
+pub(crate) enum OpaqueSaslV0Outcome {
+    Continue(Bytes),
+    Authenticated(Bytes),
+    Failed(Bytes),
 }
 
 impl std::fmt::Debug for RouteSession {
@@ -189,6 +209,7 @@ impl RouteSession {
     pub fn anonymous() -> Self {
         Self {
             authentication: None,
+            framing: Arc::new(Mutex::new(ConnectionFraming::Kafka)),
         }
     }
 
@@ -196,6 +217,7 @@ impl RouteSession {
     pub fn sasl(config: Arc<SASLConfig>, limits: SaslLimits) -> Self {
         Self {
             authentication: Some(Authentication::server_with_limits(config, limits)),
+            framing: Arc::new(Mutex::new(ConnectionFraming::Kafka)),
         }
     }
 
@@ -209,6 +231,66 @@ impl RouteSession {
     /// Check one registry entry against this connection's identity.
     pub fn permits(&self, metadata: RouteMetadata) -> bool {
         metadata.authentication == RouteAuthentication::Anonymous || self.is_authenticated()
+    }
+
+    pub(crate) fn expects_opaque_sasl_v0(&self) -> Result<bool, Error> {
+        self.framing
+            .lock()
+            .map(|mode| *mode == ConnectionFraming::OpaqueSaslV0)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn maximum_sasl_token_size(&self) -> Option<usize> {
+        self.authentication
+            .as_ref()
+            .map(Authentication::limits)
+            .map(|limits| limits.maximum_token_size())
+    }
+
+    fn begin_opaque_sasl_v0(&self) -> Result<(), Error> {
+        let Some(authentication) = &self.authentication else {
+            return Ok(());
+        };
+        if authentication.is_exchanging()? {
+            // A v0 handshake removes the Kafka request head from subsequent
+            // tokens. The transport remains in this grammar until the
+            // verifier supplies a positive identity; every terminal failure
+            // ends the connection instead of returning to Kafka framing.
+            *self.framing.lock()? = ConnectionFraming::OpaqueSaslV0;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn authenticate_opaque_sasl_v0<State>(
+        &self,
+        mut ctx: Context<State>,
+        token: Bytes,
+    ) -> Result<OpaqueSaslV0Outcome, Error>
+    where
+        State: Send + Sync + 'static,
+    {
+        let authentication = self.authentication.clone().ok_or_else(|| {
+            Error::Message("opaque SASL mode requires authentication state".into())
+        })?;
+        assert!(ctx.insert(authentication.clone()).is_none());
+        let response = SaslAuthenticateService::default()
+            .serve(ctx, SaslAuthenticateRequest::default().auth_bytes(token))
+            .await?;
+        let token = response.auth_bytes;
+        if response.error_code != i16::from(tansu_sans_io::ErrorCode::None) {
+            return Ok(OpaqueSaslV0Outcome::Failed(token));
+        }
+        if authentication.is_authenticated() {
+            *self.framing.lock()? = ConnectionFraming::Kafka;
+            Ok(OpaqueSaslV0Outcome::Authenticated(token))
+        } else {
+            Ok(OpaqueSaslV0Outcome::Continue(token))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_opaque_sasl_v0_for_transport_test(&self) {
+        *self.framing.lock().expect("test framing lock") = ConnectionFraming::OpaqueSaslV0;
     }
 }
 
@@ -320,7 +402,13 @@ where
         if let Some(authentication) = self.session.authentication.clone() {
             assert!(ctx.insert(authentication).is_none());
         }
-        self.routes.serve_admitted(ctx, request).await
+        let enters_opaque_sasl_v0 = request.head().api_key() == SaslHandshakeRequest::KEY
+            && request.head().api_version() == 0;
+        let reply = self.routes.serve_admitted(ctx, request).await?;
+        if enters_opaque_sasl_v0 {
+            self.session.begin_opaque_sasl_v0().map_err(E::from)?;
+        }
+        Ok(reply)
     }
 }
 
@@ -504,14 +592,16 @@ where
 mod tests {
     use bytes::Bytes;
     use rama::{Context, Layer as _, Service as _, service::BoxService};
+    use rsasl::callback::SessionCallback;
+    use tansu_auth::{SaslHandshakeService, configuration_with_callback_for};
     use tansu_sans_io::{
         ApiKey as _, ApiVersionsRequest, Body, DecodeLimits, Header, MetadataRequest,
-        MetadataResponse,
+        MetadataResponse, SaslHandshakeRequest, ScramMechanism,
     };
 
     use super::{
-        AdmittedRouteService, RequestDecodeLimits, RouteAdmissionClass, RouteDecodeStrategy,
-        RouteMetadata, RouteSession,
+        AdmittedRouteService, OpaqueSaslV0Outcome, RequestDecodeLimits, RouteAdmissionClass,
+        RouteDecodeStrategy, RouteMetadata, RouteSession,
     };
     use crate::{
         AdmittedFrame, AdmittedReply, Error, FrameRouteService, Reply, RequestLayer,
@@ -561,6 +651,53 @@ mod tests {
 
     fn entries(routes: &AdmittedRouteService<(), Error, ()>) -> Vec<RouteMetadata> {
         routes.entries().collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NoopCallback;
+
+    impl SessionCallback for NoopCallback {}
+
+    #[tokio::test]
+    async fn successful_v0_negotiation_selects_connection_local_opaque_framing() {
+        let config = configuration_with_callback_for(NoopCallback, ScramMechanism::Scram256)
+            .expect("SCRAM configuration");
+        let session = RouteSession::sasl(config, tansu_auth::SaslLimits::default());
+        let mut ctx = Context::default();
+        assert!(
+            ctx.insert(session.authentication.clone().unwrap())
+                .is_none()
+        );
+        let response = SaslHandshakeService
+            .serve(
+                ctx,
+                SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            i16::from(tansu_sans_io::ErrorCode::None),
+            response.error_code
+        );
+        assert!(
+            session
+                .authentication
+                .as_ref()
+                .unwrap()
+                .is_exchanging()
+                .unwrap()
+        );
+        assert!(!session.expects_opaque_sasl_v0().unwrap());
+
+        session.begin_opaque_sasl_v0().unwrap();
+        assert!(session.expects_opaque_sasl_v0().unwrap());
+
+        let outcome = session
+            .authenticate_opaque_sasl_v0(Context::default(), Bytes::from_static(b"malformed"))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, OpaqueSaslV0Outcome::Failed(_)));
+        assert!(session.expects_opaque_sasl_v0().unwrap());
     }
 
     #[tokio::test]
