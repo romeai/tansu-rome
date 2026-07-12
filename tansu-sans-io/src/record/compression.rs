@@ -26,9 +26,11 @@ use std::{
 use crate::Compression;
 
 mod gzip;
+mod lz4;
 mod snappy;
 
 pub use gzip::GzipDecoder;
+pub use lz4::Lz4Decoder;
 pub use snappy::XerialSnappyDecoder;
 
 /// Zstandard's backend minimum window-log parameter; exact preflight may enforce a smaller
