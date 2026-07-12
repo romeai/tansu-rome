@@ -1332,6 +1332,609 @@ fn message_meta(messages: &[Message]) -> TokenStream {
     }
 }
 
+fn borrowed_name(name: &Type) -> Type {
+    syn::parse_str::<Type>(&format!("Borrowed{}", name.to_token_stream()))
+        .unwrap_or_else(|_| panic!("borrowed type for {}", name.to_token_stream()))
+}
+
+fn borrowed_parse_name(name: &Type) -> syn::Ident {
+    syn::parse_str::<syn::Ident>(
+        &format!("parse_borrowed_{}", name.to_token_stream()).to_case(Case::Snake),
+    )
+    .unwrap_or_else(|_| panic!("borrowed parser for {}", name.to_token_stream()))
+}
+
+fn borrowed_iterator_name(name: &Type) -> Type {
+    syn::parse_str::<Type>(&format!("Borrowed{}Iter", name.to_token_stream()))
+        .unwrap_or_else(|_| panic!("borrowed iterator for {}", name.to_token_stream()))
+}
+
+fn borrowed_field_storage(field: &Field) -> TokenStream {
+    if field.kind().is_sequence() {
+        quote!(crate::borrowed::Sequence)
+    } else {
+        match field.kind().name() {
+            "string" | "bytes" | "records" => quote!(std::ops::Range<usize>),
+            "bool" => quote!(bool),
+            "float64" => quote!(f64),
+            "int8" => quote!(i8),
+            "int16" => quote!(i16),
+            "int32" => quote!(i32),
+            "int64" => quote!(i64),
+            "uint16" => quote!(u16),
+            "uuid" => quote!([u8; 16]),
+            kind => panic!(
+                "unsupported borrowed field kind {kind} for {}",
+                field.name()
+            ),
+        }
+    }
+}
+
+fn borrowed_active(field: &Field) -> TokenStream {
+    let start = field.versions().start;
+    let end = field.versions().end;
+    quote!((#start..=#end).contains(&api_version))
+}
+
+fn borrowed_nullable(field: &Field) -> TokenStream {
+    field.nullable().map_or_else(
+        || quote!(false),
+        |range| {
+            let start = range.start;
+            let end = range.end;
+            quote!((#start..=#end).contains(&api_version))
+        },
+    )
+}
+
+fn borrowed_is_optional(field: &Field, parent: Option<&Field>) -> bool {
+    field.nullable().is_some() || !field.versions().is_mandatory(parent.map(Field::versions))
+}
+
+fn borrowed_field_parse(field: &Field) -> TokenStream {
+    let ident = field.ident();
+    let active = borrowed_active(field);
+    let nullable = borrowed_nullable(field);
+
+    if field.kind().is_sequence() {
+        let children = field.fields().unwrap_or_else(|| {
+            panic!(
+                "borrowed record-bearing request array {} must describe its element fields",
+                field.name()
+            )
+        });
+        let child_name = field.kind().type_name();
+        let child_parse = borrowed_parse_name(&child_name);
+        let _ = children;
+        quote! {
+            let #ident = if #active {
+                cursor.sequence(flexible, #nullable)?
+            } else {
+                None
+            };
+            if let Some(section) = #ident {
+                for _ in 0..section.count {
+                    let _ = #child_parse(cursor, api_version, flexible)?;
+                }
+            }
+        }
+    } else {
+        let read = match field.kind().name() {
+            "string" => quote!(cursor.string(flexible, #nullable)?),
+            "bytes" => quote!(cursor.bytes_field(flexible, #nullable)?),
+            "records" => quote!(cursor.records(flexible, #nullable)?),
+            "bool" => quote!(Some(cursor.boolean()?)),
+            "float64" => quote!(Some(cursor.f64()?)),
+            "int8" => quote!(Some(cursor.i8()?)),
+            "int16" => quote!(Some(cursor.i16()?)),
+            "int32" => quote!(Some(cursor.i32()?)),
+            "int64" => quote!(Some(cursor.i64()?)),
+            "uint16" => quote!(Some(cursor.u16()?)),
+            "uuid" => quote!(Some(cursor.uuid()?)),
+            kind => panic!(
+                "unsupported borrowed field kind {kind} for {}",
+                field.name()
+            ),
+        };
+        let validate_records = (field.kind().name() == "records").then(|| {
+            quote! {
+                if let Some(range) = #ident.as_ref() {
+                    cursor.validate_records(range)?;
+                }
+            }
+        });
+
+        quote! {
+            let #ident = if #active {
+                #read
+            } else {
+                None
+            };
+            #validate_records
+        }
+    }
+}
+
+fn borrowed_field_accessor(field: &Field, parent: Option<&Field>, root: bool) -> TokenStream {
+    let ident = field.ident();
+    let optional = borrowed_is_optional(field, parent);
+    let bytes = if root {
+        quote!(self.frame.as_ref())
+    } else {
+        quote!(self.bytes)
+    };
+    let invariant = format!(
+        "generated borrowed {} field must be present in this API version",
+        field.name()
+    );
+    let about = field
+        .about()
+        .unwrap_or("A field derived from the Kafka message schema.")
+        .replace('[', "\\[")
+        .replace(']', "\\]");
+
+    if field.kind().is_sequence() {
+        let child_name = field.kind().type_name();
+        let iterator = borrowed_iterator_name(&child_name);
+        let make = quote! {
+            #iterator {
+                cursor: crate::borrowed::Cursor::at(
+                    #bytes,
+                    self.limits,
+                    section.elements_start,
+                ),
+                remaining: section.count,
+                api_version: self.api_version,
+                flexible: self.flexible,
+            }
+        };
+        if optional {
+            quote! {
+                #[doc = #about]
+                pub fn #ident(&self) -> Option<#iterator<'_>> {
+                    self.#ident.map(|section| #make)
+                }
+            }
+        } else {
+            quote! {
+                #[doc = #about]
+                pub fn #ident(&self) -> #iterator<'_> {
+                    let section = self.#ident.expect(#invariant);
+                    #make
+                }
+            }
+        }
+    } else {
+        match field.kind().name() {
+            "string" => {
+                if optional {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> crate::Result<Option<&str>> {
+                            self.#ident
+                                .as_ref()
+                                .map(|range| crate::borrowed::borrow_string(#bytes, range))
+                                .transpose()
+                        }
+                    }
+                } else {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> crate::Result<&str> {
+                            crate::borrowed::borrow_string(
+                                #bytes,
+                                self.#ident.as_ref().expect(#invariant),
+                            )
+                        }
+                    }
+                }
+            }
+            "bytes" => {
+                if optional {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> Option<&[u8]> {
+                            self.#ident.as_ref().map(|range| &#bytes[range.clone()])
+                        }
+                    }
+                } else {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> &[u8] {
+                            &#bytes[self.#ident.as_ref().expect(#invariant).clone()]
+                        }
+                    }
+                }
+            }
+            "records" => {
+                let repeated_crc = format!(
+                    "{} Repeated calls validate the borrowed record-set CRCs again because the O(1) envelope intentionally retains no peer-cardinality-sized proof table.",
+                    about
+                );
+                if optional {
+                    quote! {
+                        #[doc = #repeated_crc]
+                        pub fn #ident(&self) -> crate::Result<Option<crate::record::borrowed::RecordSet<'_>>> {
+                            self.#ident
+                                .as_ref()
+                                .map(|range| crate::record::borrowed::RecordSet::from_bytes_with_limits(
+                                    &#bytes[range.clone()],
+                                    self.limits,
+                                ))
+                                .transpose()
+                        }
+                    }
+                } else {
+                    quote! {
+                        #[doc = #repeated_crc]
+                        pub fn #ident(&self) -> crate::Result<crate::record::borrowed::RecordSet<'_>> {
+                            crate::record::borrowed::RecordSet::from_bytes_with_limits(
+                                &#bytes[self.#ident.as_ref().expect(#invariant).clone()],
+                                self.limits,
+                            )
+                        }
+                    }
+                }
+            }
+            _ => {
+                let ty = borrowed_field_storage(field);
+                if optional {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> Option<#ty> {
+                            self.#ident
+                        }
+                    }
+                } else {
+                    quote! {
+                        #[doc = #about]
+                        pub fn #ident(&self) -> #ty {
+                            self.#ident.expect(#invariant)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn borrowed_nested_struct(parent: &Field) -> TokenStream {
+    let fields = parent.fields().unwrap_or_else(|| {
+        panic!(
+            "borrowed nested field {} must describe its fields",
+            parent.name()
+        )
+    });
+    let name = parent.kind().type_name();
+    let borrowed = borrowed_name(&name);
+    let iterator = borrowed_iterator_name(&name);
+    let parse = borrowed_parse_name(&name);
+
+    let definitions = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(|field| {
+            let ident = field.ident();
+            let storage = borrowed_field_storage(field);
+            quote!(#ident: Option<#storage>)
+        });
+    let parsers = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(borrowed_field_parse);
+    let assignments = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(Field::ident)
+        .collect::<Vec<_>>();
+    let accessors = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(|field| borrowed_field_accessor(field, Some(parent), false));
+    let descendants = fields
+        .iter()
+        .filter(|field| field.kind().is_sequence())
+        .map(borrowed_nested_struct);
+    let traversal_fields = fields
+        .iter()
+        .any(|field| field.kind().is_sequence())
+        .then(|| {
+            quote! {
+                api_version: i16,
+                flexible: bool,
+            }
+        });
+    let traversal_assignments = fields
+        .iter()
+        .any(|field| field.kind().is_sequence())
+        .then(|| {
+            quote! {
+                api_version,
+                flexible,
+            }
+        });
+
+    quote! {
+        #[derive(Clone, Debug)]
+        pub struct #borrowed<'a> {
+            bytes: &'a [u8],
+            limits: crate::DecodeLimits,
+            #traversal_fields
+            #(#definitions,)*
+        }
+
+        impl<'a> #borrowed<'a> {
+            #(#accessors)*
+        }
+
+        fn #parse<'a>(
+            cursor: &mut crate::borrowed::Cursor<'a>,
+            api_version: i16,
+            flexible: bool,
+        ) -> crate::Result<#borrowed<'a>> {
+            #(#parsers)*
+            if flexible {
+                cursor.tagged_fields()?;
+            }
+            Ok(#borrowed {
+                bytes: cursor.bytes(),
+                limits: cursor.limits(),
+                #traversal_assignments
+                #(#assignments,)*
+            })
+        }
+
+        /// O(1)-state replay iterator over a generated borrowed structure array.
+        ///
+        /// Items remain `Result` so replay defensively checks the already validated byte
+        /// boundaries without retaining a peer-cardinality-sized range table.
+        #[derive(Clone, Debug)]
+        pub struct #iterator<'a> {
+            cursor: crate::borrowed::Cursor<'a>,
+            remaining: usize,
+            api_version: i16,
+            flexible: bool,
+        }
+
+        impl<'a> Iterator for #iterator<'a> {
+            type Item = crate::Result<#borrowed<'a>>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.remaining == 0 {
+                    return None;
+                }
+                self.remaining -= 1;
+                Some(#parse(&mut self.cursor, self.api_version, self.flexible))
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.remaining, Some(self.remaining))
+            }
+        }
+
+        impl ExactSizeIterator for #iterator<'_> {}
+
+        #(#descendants)*
+    }
+}
+
+fn borrowed_record_request(message: &Message) -> TokenStream {
+    fn reject_tagged_fields(message: &Message, fields: &[Field], path: &str) {
+        for field in fields {
+            let field_path = format!("{path}.{}", field.name());
+            if field.tag().is_some() || field.tagged().is_some() {
+                panic!(
+                    "cannot generate borrowed {}: tagged field {field_path} needs an explicit borrowed accessor",
+                    message.name()
+                );
+            }
+            if let Some(children) = field.fields() {
+                reject_tagged_fields(message, children, &field_path);
+            }
+        }
+    }
+
+    fn field_structure_depth(field: &Field) -> usize {
+        field.fields().map_or(0, |children| {
+            2 + children
+                .iter()
+                .map(field_structure_depth)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    reject_tagged_fields(message, message.fields(), message.name());
+
+    let message_name = message.type_name();
+    let borrowed = borrowed_name(&message_name);
+    let module =
+        syn::parse_str::<syn::Ident>(&format!("borrowed_{}", message.name()).to_case(Case::Snake))
+            .unwrap_or_else(|_| panic!("borrowed module for {}", message.name()));
+    let api_key = message.api_key();
+    let valid = message.version().valid();
+    let min_version = valid.start;
+    let max_version = valid.end;
+    let flexible = message.version().flexible();
+    let flexible_start = flexible.start;
+    let flexible_end = flexible.end;
+    let message_name_string = message.name();
+    let schema_nesting_depth = 1 + message
+        .fields()
+        .iter()
+        .map(field_structure_depth)
+        .max()
+        .unwrap_or(0);
+
+    let fields = message.fields();
+    let definitions = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(|field| {
+            let ident = field.ident();
+            let storage = borrowed_field_storage(field);
+            quote!(#ident: Option<#storage>)
+        });
+    let parsers = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(borrowed_field_parse);
+    let assignments = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(Field::ident)
+        .collect::<Vec<_>>();
+    let accessors = fields
+        .iter()
+        .filter(|field| field.tag().is_none())
+        .map(|field| borrowed_field_accessor(field, None, true));
+    let descendants = fields
+        .iter()
+        .filter(|field| field.kind().is_sequence())
+        .map(borrowed_nested_struct);
+
+    let api_key_doc = format!(
+        "Kafka API key for {message_name_string}, derived from its JSON message descriptor."
+    );
+    let min_version_doc =
+        format!("Oldest {message_name_string} version accepted by its JSON message descriptor.");
+    let max_version_doc =
+        format!("Newest {message_name_string} version accepted by its JSON message descriptor.");
+    let flexible_start_doc =
+        format!("First flexible {message_name_string} version from its JSON message descriptor.");
+    let flexible_end_doc =
+        format!("Last flexible {message_name_string} version from its JSON message descriptor.");
+    let nesting_depth_doc = format!(
+        "Maximum {message_name_string} structure depth derived from its JSON field tree; checking it keeps explicit decode limits consistent with owned generation."
+    );
+
+    quote! {
+        pub mod #module {
+            #[doc = #api_key_doc]
+            const API_KEY: i16 = #api_key;
+            #[doc = #min_version_doc]
+            const MIN_VERSION: i16 = #min_version;
+            #[doc = #max_version_doc]
+            const MAX_VERSION: i16 = #max_version;
+            #[doc = #flexible_start_doc]
+            const FLEXIBLE_START: i16 = #flexible_start;
+            #[doc = #flexible_end_doc]
+            const FLEXIBLE_END: i16 = #flexible_end;
+            #[doc = #nesting_depth_doc]
+            const SCHEMA_NESTING_DEPTH: usize = #schema_nesting_depth;
+
+            /// Bounded, frame-backed view of a Kafka request containing magic-v2 record fields.
+            #[derive(Clone, Debug)]
+            pub struct #borrowed {
+                frame: bytes::Bytes,
+                limits: crate::DecodeLimits,
+                api_version: i16,
+                correlation_id: i32,
+                client_id: Option<std::ops::Range<usize>>,
+                flexible: bool,
+                #(#definitions,)*
+            }
+
+            impl #borrowed {
+                /// Decode one exact frame with [`crate::DecodeLimits::default`].
+                pub fn from_bytes(frame: bytes::Bytes) -> crate::Result<Self> {
+                    Self::from_bytes_with_limits(frame, crate::DecodeLimits::default())
+                }
+
+                /// Decode one exact frame under explicit structural and record-batch limits.
+                pub fn from_bytes_with_limits(
+                    frame: bytes::Bytes,
+                    limits: crate::DecodeLimits,
+                ) -> crate::Result<Self> {
+                    limits.validate()?;
+                    if SCHEMA_NESTING_DEPTH > limits.max_nesting_depth {
+                        return Err(crate::Error::DecodeLimitExceeded {
+                            kind: crate::DecodeLimit::NestingDepth,
+                            limit: limits.max_nesting_depth,
+                            actual: SCHEMA_NESTING_DEPTH,
+                        });
+                    }
+                    let (head, mut cursor) = crate::borrowed::Cursor::request(
+                        &frame,
+                        limits,
+                        API_KEY,
+                        MIN_VERSION,
+                        MAX_VERSION,
+                        FLEXIBLE_START,
+                        FLEXIBLE_END,
+                    )?;
+                    let api_version = head.api_version;
+                    let flexible = head.flexible;
+                    let (#(#assignments,)*) = {
+                        let cursor = &mut cursor;
+                        #(#parsers)*
+                        if flexible {
+                            cursor.tagged_fields()?;
+                        }
+                        cursor.finish()?;
+                        (#(#assignments,)*)
+                    };
+                    Ok(Self {
+                        frame,
+                        limits,
+                        api_version,
+                        correlation_id: head.correlation_id,
+                        client_id: head.client_id,
+                        flexible,
+                        #(#assignments,)*
+                    })
+                }
+
+                /// Complete length-prefixed request frame retained by this view.
+                pub fn frame(&self) -> &bytes::Bytes {
+                    &self.frame
+                }
+
+                /// API version read from the request header.
+                pub fn api_version(&self) -> i16 {
+                    self.api_version
+                }
+
+                /// Correlation id read from the request header.
+                pub fn correlation_id(&self) -> i32 {
+                    self.correlation_id
+                }
+
+                /// Optional client id borrowed from the retained request frame.
+                pub fn client_id(&self) -> crate::Result<Option<&str>> {
+                    self.client_id
+                        .as_ref()
+                        .map(|range| crate::borrowed::borrow_string(&self.frame, range))
+                        .transpose()
+                }
+
+                #(#accessors)*
+            }
+
+            impl crate::ApiKey for #borrowed {
+                const KEY: i16 = API_KEY;
+            }
+
+            impl crate::ApiName for #borrowed {
+                const NAME: &'static str = #message_name_string;
+            }
+
+            #(#descendants)*
+        }
+
+        pub use #module::#borrowed;
+    }
+}
+
+fn borrowed_record_requests(messages: &[Message]) -> TokenStream {
+    let generated = messages
+        .iter()
+        .filter(|message| message.kind() == MessageKind::Request && message.has_records())
+        .map(borrowed_record_request);
+    quote!(#(#generated)*)
+}
+
 pub fn main() {
     let files = "message/[A-Z]*Re[qs]*.json";
 
@@ -1357,6 +1960,7 @@ pub fn main() {
     let untagged = process(&broker_messages, false);
 
     let message_meta = message_meta(&broker_messages);
+    let borrowed_record_requests = borrowed_record_requests(&broker_messages);
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generate.rs");
@@ -1365,6 +1969,7 @@ pub fn main() {
         #tagged
         #untagged
         #message_meta
+        #borrowed_record_requests
     };
 
     let r = syn::parse_file(&q.to_string()).unwrap_or_else(|_| panic!("{}", q.to_string()));

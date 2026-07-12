@@ -117,6 +117,7 @@
 //! map from the [Serde Data Model](https://serde.rs/data-model.html) to the Kafka protocol or vice versa.
 
 pub mod acl;
+mod borrowed;
 pub mod consumer;
 pub mod de;
 pub mod primitive;

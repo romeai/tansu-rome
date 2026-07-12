@@ -24,7 +24,7 @@
 
 use std::ops::Range;
 
-use crate::{DecodeLimit, DecodeLimits, Error, Result};
+use crate::{DecodeLimit, DecodeLimits, Error, Result, borrowed::DecodeBudget};
 
 /// Offset of `base_offset`, the first field in Kafka's magic-v2 record batch layout.
 const BASE_OFFSET_OFFSET: usize = 0;
@@ -125,23 +125,8 @@ impl<'a> RecordSet<'a> {
     /// by `max_bytes`.
     pub fn from_bytes_with_limits(bytes: &'a [u8], limits: DecodeLimits) -> Result<Self> {
         limits.validate()?;
-        check_limit(DecodeLimit::Bytes, limits.max_bytes, bytes.len())?;
-
-        let mut offset = 0usize;
-        let mut batch_count = 0usize;
-        while offset < bytes.len() {
-            let batch = validate_batch(bytes, offset, limits)?;
-            batch_count = batch_count.checked_add(1).ok_or(Error::Overflow)?;
-            check_limit(
-                DecodeLimit::SequenceElements,
-                limits.max_sequence_elements,
-                batch_count,
-            )?;
-            check_limit(DecodeLimit::WorkUnits, limits.max_work_units, batch_count)?;
-            offset = batch.end;
-        }
-
-        debug_assert_eq!(offset, bytes.len());
+        let mut budget = DecodeBudget::new(limits);
+        let batch_count = validate_with_budget(bytes, &mut budget)?;
         Ok(Self {
             bytes,
             validation: Validation { batch_count },
@@ -168,6 +153,23 @@ impl<'a> RecordSet<'a> {
             remaining: self.validation.batch_count,
         }
     }
+}
+
+pub(crate) fn validate_with_budget(bytes: &[u8], budget: &mut DecodeBudget) -> Result<usize> {
+    let limits = budget.limits();
+    check_limit(DecodeLimit::Bytes, limits.max_bytes, bytes.len())?;
+
+    let mut offset = 0usize;
+    let mut local_batch_count = 0usize;
+    while offset < bytes.len() {
+        let batch = validate_batch(bytes, offset, limits)?;
+        budget.charge_batch()?;
+        local_batch_count = local_batch_count.checked_add(1).ok_or(Error::Overflow)?;
+        offset = batch.end;
+    }
+
+    debug_assert_eq!(offset, bytes.len());
+    Ok(local_batch_count)
 }
 
 /// Allocation-free iterator over the batches in a validated [`RecordSet`].
