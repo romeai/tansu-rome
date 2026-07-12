@@ -26,6 +26,13 @@ use std::ops::Range;
 
 use crate::{DecodeLimit, DecodeLimits, Error, Result, borrowed::DecodeBudget};
 
+pub(crate) mod records;
+
+pub use records::{
+    HeaderRef, Headers, RecordDecodeError, RecordDecodeLimit, RecordDecodeLimits, RecordRef,
+    Records,
+};
+
 /// Offset of `base_offset`, the first field in Kafka's magic-v2 record batch layout.
 const BASE_OFFSET_OFFSET: usize = 0;
 /// Width of `base_offset`, which Kafka encodes as a signed 64-bit integer.
