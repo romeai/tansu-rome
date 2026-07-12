@@ -435,6 +435,8 @@ pub enum Error {
     ParseScram(String),
     Poison,
     ResponseFrame,
+    #[error(transparent)]
+    RecordSet(#[from] crate::record::borrowed::RecordSetError),
     Snap(#[from] snap::Error),
     StringWithoutApiVersion,
     StringWithoutLength,
@@ -459,6 +461,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Error::Message(e) => f.write_str(e),
+            Error::RecordSet(e) => Display::fmt(e, f),
             e => write!(f, "{e:?}"),
         }
     }

@@ -96,6 +96,101 @@ const MIN_BATCH_BYTES: usize = RECORD_DATA_OFFSET;
 /// Offset of the first CRC-covered byte; Kafka excludes the prefix, magic, and CRC itself.
 const CRC_DATA_OFFSET: usize = ATTRIBUTES_OFFSET;
 
+/// Typed structural failures found while validating a magic-v2 record set.
+///
+/// These variants preserve the exact batch and field context needed by embedders to translate a
+/// malformed partition into the appropriate Kafka error without matching human-readable text.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RecordSetError {
+    /// Bytes remained after the last complete batch but could not form another batch prefix.
+    #[error(
+        "record set has {remaining} trailing bytes at offset {offset}, fewer than the {required}-byte batch prefix"
+    )]
+    TruncatedBatchPrefix {
+        /// Offset where another batch would begin.
+        offset: usize,
+        /// Bytes remaining in the record set.
+        remaining: usize,
+        /// Bytes required for `base_offset` and `batch_length`.
+        required: usize,
+    },
+    /// Kafka's signed batch length was negative.
+    #[error("record batch at offset {offset} declares negative length {length}")]
+    NegativeBatchLength {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Peer-declared signed batch length.
+        length: i32,
+    },
+    /// The declared batch cannot contain the fixed magic-v2 fields.
+    #[error(
+        "record batch at offset {offset} declares length {length}, smaller than the {minimum}-byte magic-v2 header"
+    )]
+    BatchLengthTooSmall {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Nonnegative peer-declared batch length.
+        length: usize,
+        /// Smallest legal magic-v2 batch body.
+        minimum: usize,
+    },
+    /// Checked arithmetic could not represent the declared batch boundary.
+    #[error("record batch boundary overflows at offset {offset} with declared length {length}")]
+    BatchBoundaryOverflow {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Nonnegative peer-declared batch length.
+        length: usize,
+    },
+    /// The declared batch boundary lies beyond the enclosing record set.
+    #[error(
+        "record batch at offset {offset} declares {declared} total bytes but only {available} remain"
+    )]
+    BatchExceedsRecordSet {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Complete batch bytes including `base_offset` and `batch_length`.
+        declared: usize,
+        /// Bytes available from the batch start.
+        available: usize,
+    },
+    /// The batch uses a record encoding other than magic 2.
+    #[error(
+        "record batch at offset {offset} uses unsupported magic {actual}; expected magic {expected}"
+    )]
+    UnsupportedMagic {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Peer-provided magic byte.
+        actual: i8,
+        /// Magic byte supported by this borrowed representation.
+        expected: i8,
+    },
+    /// Kafka's signed record count was negative.
+    #[error("record batch at offset {offset} declares negative record count {count}")]
+    NegativeRecordCount {
+        /// Batch start within the record set.
+        offset: usize,
+        /// Peer-declared signed count.
+        count: i32,
+    },
+    /// The number of structurally validated batches overflowed this address space.
+    #[error("record set batch count overflows this address space")]
+    BatchCountOverflow,
+    /// The CRC-32C covering batch attributes through record data did not match.
+    #[error(
+        "record batch at offset {offset} has CRC mismatch: declared {declared:#010x}, computed {computed:#010x}"
+    )]
+    CrcMismatch {
+        /// Batch start within the record set.
+        offset: usize,
+        /// CRC encoded by the peer.
+        declared: u32,
+        /// CRC computed from the immutable batch bytes.
+        computed: u32,
+    },
+}
+
 /// A completely validated, magic-v2 Kafka record set borrowing its wire bytes.
 ///
 /// Construction is the only validation boundary. It scans all batch lengths, magic bytes, and
@@ -171,12 +266,18 @@ pub(crate) fn validate_with_budget(bytes: &[u8], budget: &mut DecodeBudget) -> R
     while offset < bytes.len() {
         let batch = validate_batch(bytes, offset, limits)?;
         budget.charge_batch()?;
-        local_batch_count = local_batch_count.checked_add(1).ok_or(Error::Overflow)?;
+        local_batch_count = increment_batch_count(local_batch_count)?;
         offset = batch.end;
     }
 
     debug_assert_eq!(offset, bytes.len());
     Ok(local_batch_count)
+}
+
+fn increment_batch_count(count: usize) -> Result<usize> {
+    count
+        .checked_add(1)
+        .ok_or_else(|| RecordSetError::BatchCountOverflow.into())
 }
 
 /// Allocation-free iterator over the batches in a validated [`RecordSet`].
@@ -327,45 +428,58 @@ impl<'a> Batch<'a> {
 fn validate_batch(bytes: &[u8], start: usize, limits: DecodeLimits) -> Result<Range<usize>> {
     let available = bytes.len().saturating_sub(start);
     if available < BATCH_PREFIX_BYTES {
-        return Err(Error::Message(format!(
-            "record set has {available} trailing bytes, fewer than the {BATCH_PREFIX_BYTES}-byte batch prefix"
-        )));
+        return Err(RecordSetError::TruncatedBatchPrefix {
+            offset: start,
+            remaining: available,
+            required: BATCH_PREFIX_BYTES,
+        }
+        .into());
     }
 
-    let batch_length = read_i32(bytes, start + BATCH_LENGTH_OFFSET)?;
-    let batch_length = usize::try_from(batch_length)
-        .map_err(|_| Error::Message(format!("negative record batch length {batch_length}")))?;
+    let declared_batch_length = validated_i32(bytes, start + BATCH_LENGTH_OFFSET);
+    let batch_length = usize::try_from(declared_batch_length).map_err(|_| {
+        RecordSetError::NegativeBatchLength {
+            offset: start,
+            length: declared_batch_length,
+        }
+    })?;
     if batch_length < FIXED_BATCH_BODY_BYTES {
-        return Err(Error::Message(format!(
-            "record batch length {batch_length} is smaller than the {FIXED_BATCH_BODY_BYTES}-byte magic-v2 header"
-        )));
+        return Err(RecordSetError::BatchLengthTooSmall {
+            offset: start,
+            length: batch_length,
+            minimum: FIXED_BATCH_BODY_BYTES,
+        }
+        .into());
     }
 
-    let end = start
-        .checked_add(BATCH_PREFIX_BYTES)
-        .and_then(|prefix_end| prefix_end.checked_add(batch_length))
-        .ok_or(Error::Overflow)?;
+    let end = batch_end(start, batch_length)?;
     if end > bytes.len() {
-        return Err(Error::Message(format!(
-            "record batch declares {} bytes but only {available} remain",
-            BATCH_PREFIX_BYTES + batch_length
-        )));
+        return Err(RecordSetError::BatchExceedsRecordSet {
+            offset: start,
+            declared: BATCH_PREFIX_BYTES + batch_length,
+            available,
+        }
+        .into());
     }
 
     let batch = &bytes[start..end];
     debug_assert!(batch.len() >= MIN_BATCH_BYTES);
-    let magic = read_i8(batch, MAGIC_OFFSET)?;
+    let magic = validated_i8(batch, MAGIC_OFFSET);
     if magic != MAGIC_V2 {
-        return Err(Error::Message(format!(
-            "unsupported record batch magic {magic}; borrowed batches require magic {MAGIC_V2}"
-        )));
+        return Err(RecordSetError::UnsupportedMagic {
+            offset: start,
+            actual: magic,
+            expected: MAGIC_V2,
+        }
+        .into());
     }
 
-    let declared_record_count = read_i32(batch, RECORD_COUNT_OFFSET)?;
+    let declared_record_count = validated_i32(batch, RECORD_COUNT_OFFSET);
     let record_count = usize::try_from(declared_record_count).map_err(|_| {
-        Error::Message(format!(
-            "negative record count {declared_record_count} in magic-v2 batch"
-        ))
+        RecordSetError::NegativeRecordCount {
+            offset: start,
+            count: declared_record_count,
+        }
     })?;
     check_limit(
         DecodeLimit::SequenceElements,
@@ -373,15 +487,31 @@ fn validate_batch(bytes: &[u8], start: usize, limits: DecodeLimits) -> Result<Ra
         record_count,
     )?;
 
-    let declared_crc = read_u32(batch, CRC_OFFSET)?;
+    let declared_crc = validated_u32(batch, CRC_OFFSET);
     let computed_crc = crc32c(&batch[CRC_DATA_OFFSET..]);
     if declared_crc != computed_crc {
-        return Err(Error::Message(format!(
-            "record batch CRC mismatch: declared {declared_crc:#010x}, computed {computed_crc:#010x}"
-        )));
+        return Err(RecordSetError::CrcMismatch {
+            offset: start,
+            declared: declared_crc,
+            computed: computed_crc,
+        }
+        .into());
     }
 
     Ok(start..end)
+}
+
+fn batch_end(start: usize, batch_length: usize) -> Result<usize> {
+    start
+        .checked_add(BATCH_PREFIX_BYTES)
+        .and_then(|prefix_end| prefix_end.checked_add(batch_length))
+        .ok_or_else(|| {
+            RecordSetError::BatchBoundaryOverflow {
+                offset: start,
+                length: batch_length,
+            }
+            .into()
+        })
 }
 
 fn check_limit(kind: DecodeLimit, limit: usize, actual: usize) -> Result<()> {
@@ -408,6 +538,10 @@ fn read_i8(bytes: &[u8], offset: usize) -> Result<i8> {
         .copied()
         .map(|value| value as i8)
         .ok_or(Error::Overflow)
+}
+
+fn validated_i8(bytes: &[u8], offset: usize) -> i8 {
+    read_i8(bytes, offset).expect("validated record batch field must remain readable")
 }
 
 fn read_i16(bytes: &[u8], offset: usize) -> Result<i16> {
@@ -575,23 +709,60 @@ mod tests {
         let mut negative = valid.clone();
         negative[BATCH_LENGTH_OFFSET..BATCH_LENGTH_OFFSET + BATCH_LENGTH_BYTES]
             .copy_from_slice(&(-1i32).to_be_bytes());
-        assert!(RecordSet::from_bytes(&negative).is_err());
+        assert!(matches!(
+            RecordSet::from_bytes(&negative),
+            Err(Error::RecordSet(RecordSetError::NegativeBatchLength {
+                offset: 0,
+                length: -1,
+            }))
+        ));
 
         let mut short = valid.clone();
         short[BATCH_LENGTH_OFFSET..BATCH_LENGTH_OFFSET + BATCH_LENGTH_BYTES]
             .copy_from_slice(&(FIXED_BATCH_BODY_BYTES as i32 - 1).to_be_bytes());
-        assert!(RecordSet::from_bytes(&short).is_err());
+        assert!(matches!(
+            RecordSet::from_bytes(&short),
+            Err(Error::RecordSet(RecordSetError::BatchLengthTooSmall {
+                offset: 0,
+                length,
+                minimum: FIXED_BATCH_BODY_BYTES,
+            })) if length == FIXED_BATCH_BODY_BYTES - 1
+        ));
 
         let mut huge = valid.clone();
         huge[BATCH_LENGTH_OFFSET..BATCH_LENGTH_OFFSET + BATCH_LENGTH_BYTES]
             .copy_from_slice(&i32::MAX.to_be_bytes());
-        assert!(RecordSet::from_bytes(&huge).is_err());
+        assert!(matches!(
+            RecordSet::from_bytes(&huge),
+            Err(Error::RecordSet(RecordSetError::BatchExceedsRecordSet {
+                offset: 0,
+                declared,
+                available,
+            })) if declared == BATCH_PREFIX_BYTES + i32::MAX as usize && available == valid.len()
+        ));
 
         for length in 1..valid.len() {
-            assert!(
-                RecordSet::from_bytes(&valid[..length]).is_err(),
-                "truncation at {length} bytes unexpectedly validated"
-            );
+            let error = RecordSet::from_bytes(&valid[..length])
+                .expect_err("every nonempty proper prefix must fail");
+            if length < BATCH_PREFIX_BYTES {
+                assert!(matches!(
+                    error,
+                    Error::RecordSet(RecordSetError::TruncatedBatchPrefix {
+                        offset: 0,
+                        remaining,
+                        required: BATCH_PREFIX_BYTES,
+                    }) if remaining == length
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    Error::RecordSet(RecordSetError::BatchExceedsRecordSet {
+                        offset: 0,
+                        declared: MIN_BATCH_BYTES,
+                        available,
+                    }) if available == length
+                ));
+            }
         }
     }
 
@@ -602,17 +773,38 @@ mod tests {
         let mut bad_magic = valid.clone();
         bad_magic[MAGIC_OFFSET] = 1;
         let error = RecordSet::from_bytes(&bad_magic).expect_err("magic 1");
-        assert!(error.to_string().contains("magic 1"));
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::UnsupportedMagic {
+                offset: 0,
+                actual: 1,
+                expected: MAGIC_V2,
+            })
+        ));
 
         let mut bad_declared_crc = valid.clone();
         bad_declared_crc[CRC_OFFSET] ^= 1;
         let error = RecordSet::from_bytes(&bad_declared_crc).expect_err("declared CRC");
-        assert!(error.to_string().contains("CRC mismatch"));
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::CrcMismatch {
+                offset: 0,
+                declared,
+                computed,
+            }) if declared != computed
+        ));
 
         let mut bad_crc_data = valid;
         bad_crc_data[ATTRIBUTES_OFFSET] ^= 1;
         let error = RecordSet::from_bytes(&bad_crc_data).expect_err("CRC-covered data");
-        assert!(error.to_string().contains("CRC mismatch"));
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::CrcMismatch {
+                offset: 0,
+                declared,
+                computed,
+            }) if declared != computed
+        ));
     }
 
     #[test]
@@ -620,14 +812,27 @@ mod tests {
         let mut encoded = batch(0, &[]);
         encoded.push(0);
         let error = RecordSet::from_bytes(&encoded).expect_err("trailing byte");
-        assert!(error.to_string().contains("trailing bytes"));
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::TruncatedBatchPrefix {
+                offset: MIN_BATCH_BYTES,
+                remaining: 1,
+                required: BATCH_PREFIX_BYTES,
+            })
+        ));
     }
 
     #[test]
     fn record_counts_are_signed_validated_metadata_never_capacities() -> Result<()> {
         let negative = batch(-1, &[]);
         let error = RecordSet::from_bytes(&negative).expect_err("negative count");
-        assert!(error.to_string().contains("negative record count -1"));
+        assert!(matches!(
+            error,
+            Error::RecordSet(RecordSetError::NegativeRecordCount {
+                offset: 0,
+                count: -1,
+            })
+        ));
 
         let huge = batch(i32::MAX, &[]);
         assert!(matches!(
@@ -651,6 +856,21 @@ mod tests {
             records.batches().next().expect("batch").record_count()
         );
         Ok(())
+    }
+
+    #[test]
+    fn boundary_arithmetic_has_a_typed_failure() {
+        assert!(matches!(
+            batch_end(usize::MAX - BATCH_PREFIX_BYTES + 1, FIXED_BATCH_BODY_BYTES),
+            Err(Error::RecordSet(RecordSetError::BatchBoundaryOverflow {
+                offset,
+                length: FIXED_BATCH_BODY_BYTES,
+            })) if offset == usize::MAX - BATCH_PREFIX_BYTES + 1
+        ));
+        assert!(matches!(
+            increment_batch_count(usize::MAX),
+            Err(Error::RecordSet(RecordSetError::BatchCountOverflow))
+        ));
     }
 
     #[test]
