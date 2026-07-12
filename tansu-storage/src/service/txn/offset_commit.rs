@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, TxnOffsetCommitResponse};
+use tansu_sans_io::{
+    ApiKey, TxnOffsetCommitResponse,
+    txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
+};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`tansu_sans_io::TxnOffsetCommitRequest`] returning [`TxnOffsetCommitResponse`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -39,19 +42,46 @@ where
         ctx: Context<G>,
         req: tansu_sans_io::TxnOffsetCommitRequest,
     ) -> Result<Self::Response, Self::Error> {
+        let request = crate::TxnOffsetCommitRequest {
+            transaction_id: req.transactional_id,
+            group_id: req.group_id,
+            producer_id: req.producer_id,
+            producer_epoch: req.producer_epoch,
+            generation_id: req.generation_id,
+            member_id: req.member_id,
+            group_instance_id: req.group_instance_id,
+            topics: req.topics.unwrap_or_default(),
+        };
         let responses = ctx
             .state()
-            .txn_offset_commit(crate::TxnOffsetCommitRequest {
-                transaction_id: req.transactional_id.to_owned(),
-                group_id: req.group_id.to_owned(),
-                producer_id: req.producer_id,
-                producer_epoch: req.producer_epoch,
-                generation_id: req.generation_id,
-                member_id: req.member_id,
-                group_instance_id: req.group_instance_id,
-                topics: req.topics.unwrap_or_default(),
-            })
-            .await?;
+            .txn_offset_commit(request.clone())
+            .await
+            .map_api_response(
+                |response| response,
+                |code| {
+                    request
+                        .topics
+                        .iter()
+                        .map(|topic| {
+                            TxnOffsetCommitResponseTopic::default()
+                                .name(topic.name.clone())
+                                .partitions(Some(
+                                    topic
+                                        .partitions
+                                        .as_deref()
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .map(|partition| {
+                                            TxnOffsetCommitResponsePartition::default()
+                                                .partition_index(partition.partition_index)
+                                                .error_code(code.into())
+                                        })
+                                        .collect(),
+                                ))
+                        })
+                        .collect()
+                },
+            )?;
 
         Ok(TxnOffsetCommitResponse::default()
             .throttle_time_ms(0)

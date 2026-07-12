@@ -27,7 +27,7 @@ use tansu_sans_io::{
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Result, Storage, Topition, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -125,6 +125,36 @@ impl ApiKey for FetchService {
 }
 
 impl FetchService {
+    fn failed_topics(topics: &[FetchTopic], code: ErrorCode) -> Vec<FetchableTopicResponse> {
+        topics
+            .iter()
+            .map(|topic| {
+                FetchableTopicResponse::default()
+                    .topic(topic.topic.clone())
+                    .topic_id(Some([0; 16]))
+                    .partitions(Some(
+                        topic
+                            .partitions
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|partition| {
+                                PartitionData::default()
+                                    .partition_index(partition.partition)
+                                    .error_code(code.into())
+                                    .high_watermark(-1)
+                                    .last_stable_offset(Some(-1))
+                                    .log_start_offset(Some(-1))
+                                    .aborted_transactions(Some([].into()))
+                                    .preferred_read_replica(Some(-1))
+                                    .records(None)
+                            })
+                            .collect(),
+                    ))
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self,ctx,min_bytes,isolation,fetch_partition), fields(partition = fetch_partition.partition))]
     async fn fetch_partition<G>(
@@ -437,7 +467,11 @@ where
                 isolation_level,
                 topics.as_ref(),
             )
-            .await?
+            .await
+            .map_api_response(
+                |responses| responses,
+                |code| Self::failed_topics(topics.as_ref(), code),
+            )?
         } else {
             vec![]
         });

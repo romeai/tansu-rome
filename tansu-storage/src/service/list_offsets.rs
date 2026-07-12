@@ -16,12 +16,40 @@ use std::{collections::BTreeSet, ops::Deref as _};
 
 use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse,
+    ApiKey, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse,
+    list_offsets_request::ListOffsetsTopic,
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Result, Storage, Topition, service::ApiErrorResponseExt as _};
+
+fn failed_topics(topics: &[ListOffsetsTopic], code: ErrorCode) -> Vec<ListOffsetsTopicResponse> {
+    topics
+        .iter()
+        .map(|topic| {
+            ListOffsetsTopicResponse::default()
+                .name(topic.name.clone())
+                .partitions(Some(
+                    topic
+                        .partitions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|partition| {
+                            ListOffsetsPartitionResponse::default()
+                                .partition_index(partition.partition_index)
+                                .error_code(code.into())
+                                .old_style_offsets(None)
+                                .timestamp(Some(-1))
+                                .offset(Some(-1))
+                                .leader_epoch(Some(-1))
+                        })
+                        .collect(),
+                ))
+        })
+        .collect()
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```
@@ -122,7 +150,7 @@ where
         let topics = if let Some(topics) = req.topics {
             let mut offsets = vec![];
 
-            for topic in topics {
+            for topic in &topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let tp = Topition::new(topic.name.clone(), partition.partition_index);
@@ -138,45 +166,48 @@ where
                 .await
                 .inspect(|r| debug!(?r, ?offsets))
                 .inspect_err(|err| error!(?err, ?offsets))
-                .map(|offsets| {
-                    offsets
-                        .iter()
-                        .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                            _ = topics.insert(topition.topic());
-                            topics
-                        })
-                        .iter()
-                        .map(|topic_name| {
-                            ListOffsetsTopicResponse::default()
-                                .name((*topic_name).into())
-                                .partitions(Some(
-                                    offsets
-                                        .iter()
-                                        .filter_map(|(topition, offset)| {
-                                            if topition.topic() == *topic_name {
-                                                Some(
-                                                    ListOffsetsPartitionResponse::default()
-                                                        .partition_index(topition.partition())
-                                                        .error_code(offset.error_code().into())
-                                                        .old_style_offsets(None)
-                                                        .timestamp(
-                                                            offset
-                                                                .timestamp()
-                                                                .unwrap_or(Some(-1))
-                                                                .or(Some(-1)),
-                                                        )
-                                                        .offset(offset.offset().or(Some(0)))
-                                                        .leader_epoch(Some(0)),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect()
-                })
+                .map_api_response(
+                    |offsets| {
+                        offsets
+                            .iter()
+                            .fold(BTreeSet::new(), |mut topics, (topition, _)| {
+                                _ = topics.insert(topition.topic());
+                                topics
+                            })
+                            .iter()
+                            .map(|topic_name| {
+                                ListOffsetsTopicResponse::default()
+                                    .name((*topic_name).into())
+                                    .partitions(Some(
+                                        offsets
+                                            .iter()
+                                            .filter_map(|(topition, offset)| {
+                                                if topition.topic() == *topic_name {
+                                                    Some(
+                                                        ListOffsetsPartitionResponse::default()
+                                                            .partition_index(topition.partition())
+                                                            .error_code(offset.error_code().into())
+                                                            .old_style_offsets(None)
+                                                            .timestamp(
+                                                                offset
+                                                                    .timestamp()
+                                                                    .unwrap_or(Some(-1))
+                                                                    .or(Some(-1)),
+                                                            )
+                                                            .offset(offset.offset().or(Some(0)))
+                                                            .leader_epoch(Some(0)),
+                                                    )
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect(),
+                                    ))
+                            })
+                            .collect()
+                    },
+                    |code| failed_topics(&topics, code),
+                )
                 .map(Some)?
         } else {
             None
@@ -186,5 +217,31 @@ where
             .throttle_time_ms(throttle_time_ms)
             .topics(topics))
         .inspect(|r| debug!(?r))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tansu_sans_io::list_offsets_request::ListOffsetsPartition;
+
+    #[test]
+    fn rejected_list_offsets_is_reported_per_partition() {
+        let topics = [ListOffsetsTopic::default()
+            .name("events".into())
+            .partitions(Some(vec![
+                ListOffsetsPartition::default().partition_index(2),
+                ListOffsetsPartition::default().partition_index(4),
+            ]))];
+        let failed = failed_topics(&topics, ErrorCode::UnsupportedVersion);
+        let partitions = failed[0].partitions.as_ref().unwrap();
+        assert_eq!(
+            [2, 4],
+            [partitions[0].partition_index, partitions[1].partition_index]
+        );
+        assert!(partitions.iter().all(|p| matches!(
+            ErrorCode::try_from(p.error_code),
+            Ok(ErrorCode::UnsupportedVersion)
+        )));
     }
 }

@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse};
+use tansu_sans_io::{
+    ApiKey, IncrementalAlterConfigsRequest, IncrementalAlterConfigsResponse,
+    incremental_alter_configs_response::AlterConfigsResourceResponse,
+};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`IncrementalAlterConfigsRequest`] returning [`IncrementalAlterConfigsResponse`].
 /// ```
@@ -172,7 +175,23 @@ where
         let mut responses = vec![];
 
         for resource in req.resources.unwrap_or_default() {
-            responses.push(ctx.state().incremental_alter_resource(resource).await?);
+            let resource_type = resource.resource_type;
+            let resource_name = resource.resource_name.clone();
+            responses.push(
+                ctx.state()
+                    .incremental_alter_resource(resource)
+                    .await
+                    .map_api_response(
+                        |response| response,
+                        |code| {
+                            AlterConfigsResourceResponse::default()
+                                .error_code(code.into())
+                                .error_message(Some(code.to_string()))
+                                .resource_type(resource_type)
+                                .resource_name(resource_name)
+                        },
+                    )?,
+            );
         }
 
         Ok(IncrementalAlterConfigsResponse::default()

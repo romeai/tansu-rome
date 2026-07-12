@@ -16,7 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
 /// ```
@@ -110,12 +110,21 @@ where
                 req.producer_epoch,
             )
             .await
-            .map(|response| {
-                InitProducerIdResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(response.error.into())
-                    .producer_id(response.id)
-                    .producer_epoch(response.epoch)
-            })
+            .map_api_response(
+                |response| {
+                    InitProducerIdResponse::default()
+                        .throttle_time_ms(0)
+                        .error_code(response.error.into())
+                        .producer_id(response.id)
+                        .producer_epoch(response.epoch)
+                },
+                |code| {
+                    InitProducerIdResponse::default()
+                        .throttle_time_ms(0)
+                        .error_code(code.into())
+                        .producer_id(-1)
+                        .producer_epoch(-1)
+                },
+            )
     }
 }

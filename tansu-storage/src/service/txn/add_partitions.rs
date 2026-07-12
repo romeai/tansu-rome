@@ -13,10 +13,63 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ErrorCode};
+use tansu_sans_io::{
+    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ErrorCode,
+    add_partitions_to_txn_response::{
+        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult,
+    },
+};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage, TxnAddPartitionsRequest, TxnAddPartitionsResponse};
+use crate::{
+    Error, Result, Storage, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    service::ApiErrorResponseExt as _,
+};
+
+fn failed_response(request: &TxnAddPartitionsRequest, code: ErrorCode) -> TxnAddPartitionsResponse {
+    let topics =
+        |topics: &[tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic]| {
+            topics
+                .iter()
+                .map(|topic| {
+                    AddPartitionsToTxnTopicResult::default()
+                        .name(topic.name.clone())
+                        .results_by_partition(Some(
+                            topic
+                                .partitions
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|partition| {
+                                    AddPartitionsToTxnPartitionResult::default()
+                                        .partition_index(*partition)
+                                        .partition_error_code(code.into())
+                                })
+                                .collect(),
+                        ))
+                })
+                .collect()
+        };
+    match request {
+        TxnAddPartitionsRequest::VersionZeroToThree {
+            topics: requested, ..
+        } => TxnAddPartitionsResponse::VersionZeroToThree(topics(requested)),
+        TxnAddPartitionsRequest::VersionFourPlus { transactions } => {
+            TxnAddPartitionsResponse::VersionFourPlus(
+                transactions
+                    .iter()
+                    .map(|transaction| {
+                        AddPartitionsToTxnResult::default()
+                            .transactional_id(transaction.transactional_id.clone())
+                            .topic_results(Some(topics(
+                                transaction.topics.as_deref().unwrap_or_default(),
+                            )))
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`AddPartitionsToTxnRequest`] returning [`AddPartitionsToTxnResponse`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -41,7 +94,12 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let req = TxnAddPartitionsRequest::try_from(req)?;
 
-        match ctx.state().txn_add_partitions(req).await? {
+        let response = ctx
+            .state()
+            .txn_add_partitions(req.clone())
+            .await
+            .map_api_response(|response| response, |code| failed_response(&req, code))?;
+        match response {
             TxnAddPartitionsResponse::VersionZeroToThree(results_by_topic_v_3_and_below) => {
                 Ok(AddPartitionsToTxnResponse::default()
                     .throttle_time_ms(0)

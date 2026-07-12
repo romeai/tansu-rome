@@ -16,7 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`AddOffsetsToTxnRequest`] returning [`AddOffsetsToTxnResponse`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -47,10 +47,17 @@ where
                 req.group_id.as_str(),
             )
             .await
-            .map(|error_code| {
-                AddOffsetsToTxnResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(error_code.into())
-            })
+            .map_api_response(
+                |error_code| {
+                    AddOffsetsToTxnResponse::default()
+                        .throttle_time_ms(0)
+                        .error_code(error_code.into())
+                },
+                |error_code| {
+                    AddOffsetsToTxnResponse::default()
+                        .throttle_time_ms(0)
+                        .error_code(error_code.into())
+                },
+            )
     }
 }

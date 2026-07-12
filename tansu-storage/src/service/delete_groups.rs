@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse};
+use tansu_sans_io::{
+    ApiKey, DeleteGroupsRequest, DeleteGroupsResponse, delete_groups_response::DeletableGroupResult,
+};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteGroupsRequest`] returning [`DeleteGroupsResponse`].
 /// ```
@@ -73,9 +75,23 @@ where
         ctx: Context<G>,
         req: DeleteGroupsRequest,
     ) -> Result<Self::Response, Self::Error> {
+        let requested = req.groups_names.unwrap_or_default();
         ctx.state()
-            .delete_groups(req.groups_names.as_deref())
+            .delete_groups(Some(&requested))
             .await
+            .map_api_response(
+                |results| results,
+                |code| {
+                    requested
+                        .iter()
+                        .map(|group_id| {
+                            DeletableGroupResult::default()
+                                .group_id(group_id.clone())
+                                .error_code(code.into())
+                        })
+                        .collect()
+                },
+            )
             .map(Some)
             .map(|results| {
                 DeleteGroupsResponse::default()

@@ -37,7 +37,8 @@ where
         _req: DescribeAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
         Ok(DescribeAclsResponse::default()
-            .error_code(i16::from(ErrorCode::None))
+            .error_code(i16::from(ErrorCode::SecurityDisabled))
+            .error_message(Some(ErrorCode::SecurityDisabled.to_string()))
             .resources(Some([].into())))
     }
 }

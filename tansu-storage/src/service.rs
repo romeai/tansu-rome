@@ -105,6 +105,55 @@ use crate::{
     TxnOffsetCommitRequest, UpdateError, Version,
 };
 
+/// Converts storage-declared Kafka failures into protocol responses while
+/// preserving infrastructure failures as service errors.
+///
+/// `Error::Api` is part of the storage contract: it describes the result a
+/// Kafka peer must observe, rather than a failure of the connection or broker
+/// runtime. Each adapter supplies the request-shaped response because Kafka
+/// locates errors at different levels for different APIs.
+pub(crate) trait ApiErrorResponseExt<T> {
+    fn map_api_response<R>(
+        self,
+        success: impl FnOnce(T) -> R,
+        failure: impl FnOnce(ErrorCode) -> R,
+    ) -> Result<R>;
+}
+
+impl<T> ApiErrorResponseExt<T> for Result<T> {
+    fn map_api_response<R>(
+        self,
+        success: impl FnOnce(T) -> R,
+        failure: impl FnOnce(ErrorCode) -> R,
+    ) -> Result<R> {
+        match self {
+            Ok(value) => Ok(success(value)),
+            Err(Error::Api(error_code)) => Ok(failure(error_code)),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod api_error_response_tests {
+    use super::ApiErrorResponseExt as _;
+    use crate::{Error, Result};
+    use tansu_sans_io::ErrorCode;
+
+    #[test]
+    fn only_protocol_errors_become_responses() {
+        let response = Result::<()>::Err(Error::Api(ErrorCode::UnsupportedVersion))
+            .map_api_response(|()| ErrorCode::None, |code| code);
+        assert!(matches!(response, Ok(ErrorCode::UnsupportedVersion)));
+
+        let response = Result::<()>::Err(Error::Message("backend unavailable".into()))
+            .map_api_response(|()| ErrorCode::None, |code| code);
+        assert!(
+            matches!(response, Err(Error::Message(message)) if message == "backend unavailable")
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Request {
     RegisterBroker(BrokerRegistrationRequest),

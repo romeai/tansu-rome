@@ -18,7 +18,7 @@ use tansu_sans_io::{
 };
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeGroupsRequest`] returning [`DescribeGroupsResponse`].
 /// ```
@@ -78,18 +78,35 @@ where
         ctx: Context<G>,
         req: DescribeGroupsRequest,
     ) -> Result<Self::Response, Self::Error> {
+        let requested = req.groups.unwrap_or_default();
         ctx.state()
             .describe_groups(
-                req.groups.as_deref(),
+                Some(&requested),
                 req.include_authorized_operations.unwrap_or(false),
             )
             .await
-            .map(|described| {
-                described
-                    .iter()
-                    .map(DescribedGroup::from)
-                    .collect::<Vec<_>>()
-            })
+            .map_api_response(
+                |described| {
+                    described
+                        .iter()
+                        .map(DescribedGroup::from)
+                        .collect::<Vec<_>>()
+                },
+                |code| {
+                    requested
+                        .iter()
+                        .map(|group_id| {
+                            DescribedGroup::default()
+                                .error_code(code.into())
+                                .group_id(group_id.clone())
+                                .group_state(String::new())
+                                .protocol_type(String::new())
+                                .protocol_data(String::new())
+                                .members(Some([].into()))
+                        })
+                        .collect()
+                },
+            )
             .map(Some)
             .map(|groups| {
                 DescribeGroupsResponse::default()

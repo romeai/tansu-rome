@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, CreateAclsRequest, CreateAclsResponse};
+use tansu_sans_io::{
+    ApiKey, CreateAclsRequest, CreateAclsResponse, ErrorCode,
+    create_acls_response::AclCreationResult,
+};
 
 use crate::{Error, Storage};
 
@@ -34,8 +37,44 @@ where
     async fn serve(
         &self,
         _ctx: Context<G>,
-        _req: CreateAclsRequest,
+        req: CreateAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        Ok(CreateAclsResponse::default())
+        // Storage has no ACL mutation contract. Reporting success would imply
+        // authorization state changed even though no backend can retain it.
+        let error_code = ErrorCode::SecurityDisabled;
+        Ok(CreateAclsResponse::default()
+            .throttle_time_ms(0)
+            .results(Some(
+                req.creations
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|_| {
+                        AclCreationResult::default()
+                            .error_code(error_code.into())
+                            .error_message(Some(error_code.to_string()))
+                    })
+                    .collect(),
+            )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_acl_mutations_preserve_request_cardinality() {
+        let request = CreateAclsRequest::default()
+            .creations(Some(vec![Default::default(), Default::default()]));
+        let error_code = ErrorCode::SecurityDisabled;
+        let response = CreateAclsResponse::default().results(Some(
+            request
+                .creations
+                .unwrap()
+                .into_iter()
+                .map(|_| AclCreationResult::default().error_code(error_code.into()))
+                .collect(),
+        ));
+        assert_eq!(2, response.results.unwrap().len());
     }
 }

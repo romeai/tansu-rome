@@ -13,10 +13,40 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, DeleteRecordsRequest, DeleteRecordsResponse};
+use tansu_sans_io::{
+    ApiKey, DeleteRecordsRequest, DeleteRecordsResponse, ErrorCode,
+    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
+};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
+
+fn failed_topics(
+    topics: &[tansu_sans_io::delete_records_request::DeleteRecordsTopic],
+    code: ErrorCode,
+) -> Vec<DeleteRecordsTopicResult> {
+    topics
+        .iter()
+        .map(|topic| {
+            DeleteRecordsTopicResult::default()
+                .name(topic.name.clone())
+                .partitions(Some(
+                    topic
+                        .partitions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|partition| {
+                            DeleteRecordsPartitionResult::default()
+                                .partition_index(partition.partition_index)
+                                .low_watermark(-1)
+                                .error_code(code.into())
+                        })
+                        .collect(),
+                ))
+        })
+        .collect()
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteRecordsRequest`] returning [`DeleteRecordsResponse`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -39,9 +69,11 @@ where
         ctx: Context<G>,
         req: DeleteRecordsRequest,
     ) -> Result<Self::Response, Self::Error> {
+        let requested = req.topics.unwrap_or_default();
         ctx.state()
-            .delete_records(req.topics.as_deref().unwrap_or_default())
+            .delete_records(&requested)
             .await
+            .map_api_response(|topics| topics, |code| failed_topics(&requested, code))
             .map(Some)
             .map(|topics| {
                 DeleteRecordsResponse::default()

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, ScramCredential, Storage};
+use crate::{Error, Result, ScramCredential, Storage, service::ApiErrorResponseExt as _};
 use bytes::Bytes;
 use rama::{Context, Service};
 use rsasl::mechanisms::scram::tools::derive_keys;
@@ -53,18 +53,20 @@ where
                     ctx.state()
                         .delete_user_scram_credential(&deletion.name, mechanism)
                         .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(deletion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
+                        .map_api_response(
                             |()| {
                                 AlterUserScramCredentialsResult::default()
                                     .user(deletion.name.clone())
                                     .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
+                                    .error_message(None)
                             },
-                        ),
+                            |code| {
+                                AlterUserScramCredentialsResult::default()
+                                    .user(deletion.name.clone())
+                                    .error_code(code.into())
+                                    .error_message(Some(code.to_string()))
+                            },
+                        )?,
                 );
             }
         }
@@ -111,18 +113,20 @@ where
                             credential,
                         )
                         .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(upsertion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
+                        .map_api_response(
                             |()| {
                                 AlterUserScramCredentialsResult::default()
                                     .user(upsertion.name.clone())
                                     .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
+                                    .error_message(None)
                             },
-                        ),
+                            |code| {
+                                AlterUserScramCredentialsResult::default()
+                                    .user(upsertion.name.clone())
+                                    .error_code(code.into())
+                                    .error_message(Some(code.to_string()))
+                            },
+                        )?,
                 );
             }
         }

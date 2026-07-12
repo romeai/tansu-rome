@@ -18,7 +18,7 @@ use tansu_sans_io::{
 };
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
 /// ```
@@ -86,7 +86,11 @@ where
         let mut responses = vec![];
 
         for topic in req.topics.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+            let error_code = ctx
+                .state()
+                .delete_topic(&topic.clone().into())
+                .await
+                .map_api_response(|code| code, |code| code)?;
             responses.push(
                 DeletableTopicResult::default()
                     .name(topic.name.clone())
@@ -97,7 +101,11 @@ where
         }
 
         for topic in req.topic_names.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+            let error_code = ctx
+                .state()
+                .delete_topic(&topic.clone().into())
+                .await
+                .map_api_response(|code| code, |code| code)?;
 
             responses.push(
                 DeletableTopicResult::default()

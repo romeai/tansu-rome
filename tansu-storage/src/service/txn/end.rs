@@ -16,7 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, EndTxnRequest, EndTxnResponse};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EndService;
@@ -46,6 +46,9 @@ where
                 req.committed,
             )
             .await
-            .map(|error_code| EndTxnResponse::default().error_code(i16::from(error_code)))
+            .map_api_response(
+                |code| EndTxnResponse::default().error_code(i16::from(code)),
+                |code| EndTxnResponse::default().error_code(i16::from(code)),
+            )
     }
 }

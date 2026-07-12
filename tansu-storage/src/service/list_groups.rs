@@ -16,7 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use crate::{Error, Result, Storage, service::ApiErrorResponseExt as _};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```
@@ -76,12 +76,19 @@ where
         ctx.state()
             .list_groups(req.states_filter.as_deref())
             .await
-            .map(Some)
-            .map(|groups| {
-                ListGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .groups(groups)
-            })
+            .map_api_response(
+                |groups| {
+                    ListGroupsResponse::default()
+                        .throttle_time_ms(Some(0))
+                        .error_code(ErrorCode::None.into())
+                        .groups(Some(groups))
+                },
+                |code| {
+                    ListGroupsResponse::default()
+                        .throttle_time_ms(Some(0))
+                        .error_code(code.into())
+                        .groups(Some([].into()))
+                },
+            )
     }
 }
