@@ -113,13 +113,24 @@ impl DecodeBudget {
     }
 
     pub(crate) fn charge_batch(&mut self) -> Result<()> {
-        self.batch_count = self.batch_count.checked_add(1).ok_or(Error::Overflow)?;
+        self.batch_count = self
+            .batch_count
+            .checked_add(1)
+            .ok_or(crate::record::borrowed::RecordSetError::BatchCountOverflow)?;
         check_limit(
             DecodeLimit::SequenceElements,
             self.limits.max_sequence_elements,
             self.batch_count,
         )?;
-        self.charge(1)
+        self.work_units = self
+            .work_units
+            .checked_add(1)
+            .ok_or(crate::record::borrowed::RecordSetError::WorkUnitOverflow)?;
+        check_limit(
+            DecodeLimit::WorkUnits,
+            self.limits.max_work_units,
+            self.work_units,
+        )
     }
 }
 
@@ -458,5 +469,28 @@ fn check_limit(kind: DecodeLimit, limit: usize, actual: usize) -> Result<()> {
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::borrowed::RecordSetError;
+
+    #[test]
+    fn record_set_budget_counter_overflows_are_typed() {
+        let mut batches = DecodeBudget::new(DecodeLimits::default());
+        batches.batch_count = usize::MAX;
+        assert!(matches!(
+            batches.charge_batch(),
+            Err(Error::RecordSet(RecordSetError::BatchCountOverflow))
+        ));
+
+        let mut work = DecodeBudget::new(DecodeLimits::default());
+        work.work_units = usize::MAX;
+        assert!(matches!(
+            work.charge_batch(),
+            Err(Error::RecordSet(RecordSetError::WorkUnitOverflow))
+        ));
     }
 }
