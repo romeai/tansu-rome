@@ -16,6 +16,7 @@ use std::{
     collections::HashMap,
     error,
     fmt::Debug,
+    future::Future,
     io,
     marker::PhantomData,
     mem::size_of,
@@ -34,7 +35,7 @@ use rama::{
 };
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter, Interest},
     net::{TcpListener, TcpStream},
     sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
     task::{Id, JoinError, JoinSet},
@@ -349,6 +350,14 @@ where
         timeout: Duration,
     },
 
+    /// The peer disconnected while its request was still awaiting admission.
+    #[error("peer disconnected while request admission was pending")]
+    Disconnected(#[source] AdmissionDisconnect),
+
+    /// The configured disconnect observer could not inspect its transport.
+    #[error("request-admission disconnect monitor failed")]
+    DisconnectMonitor(#[source] io::Error),
+
     /// Request admission explicitly aborted.
     #[error("request admission policy aborted")]
     Policy(#[source] P),
@@ -356,6 +365,98 @@ where
     /// The admitted request service failed fatally.
     #[error("admitted request service failed")]
     Service(#[source] S),
+}
+
+/// A non-consuming peer disconnect observed while admission was pending.
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionDisconnect {
+    /// The peer closed its sending direction cleanly.
+    #[error("peer closed its sending direction")]
+    Closed,
+
+    /// The socket reported a peer-side failure such as a reset.
+    #[error("peer socket failed")]
+    Socket(#[source] io::Error),
+
+    /// The reactor reported an error after the socket error was already cleared.
+    #[error("peer socket reported error readiness")]
+    ErrorReady,
+}
+
+/// Observe transport disconnects without consuming protocol bytes.
+///
+/// A generic [`AsyncReadExt`] implementation cannot promise this property:
+/// probing it would remove bytes that the admitted request must later read.
+/// This additive seam lets raw TCP, TLS, or another transport provide its own
+/// non-consuming signal while the default runtime performs no observation.
+pub trait AdmissionDisconnectMonitor<Stream> {
+    /// Wait until `stream` disconnects, or fail to inspect the transport.
+    fn disconnected(
+        &self,
+        stream: &Stream,
+    ) -> impl Future<Output = Result<AdmissionDisconnect, io::Error>> + Send;
+}
+
+/// Default admission behavior which does not inspect a generic stream.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct NoopAdmissionDisconnectMonitor;
+
+impl<Stream> AdmissionDisconnectMonitor<Stream> for NoopAdmissionDisconnectMonitor
+where
+    Stream: Sync,
+{
+    async fn disconnected(&self, _stream: &Stream) -> Result<AdmissionDisconnect, io::Error> {
+        std::future::pending().await
+    }
+}
+
+/// Non-consuming disconnect observation for a raw Tokio TCP stream.
+///
+/// Read readiness may mean that request body bytes are already queued rather
+/// than that the peer has disconnected. The positive probe interval prevents
+/// repeatedly polling that level-triggered readiness at full speed while a
+/// capacity policy remains pending. No interval is supplied by default:
+/// callers must select one for their latency and wake-up budget.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TcpAdmissionDisconnectMonitor {
+    probe_interval: Duration,
+}
+
+impl TcpAdmissionDisconnectMonitor {
+    /// Configure how often queued readable bytes are rechecked for a hangup.
+    pub fn new(probe_interval: Duration) -> Result<Self, TcpTransportConfigError> {
+        Ok(Self {
+            probe_interval: checked_duration("admission disconnect probe", probe_interval)?,
+        })
+    }
+
+    /// Return the positive interval between inconclusive readiness probes.
+    pub fn probe_interval(&self) -> Duration {
+        self.probe_interval
+    }
+}
+
+impl AdmissionDisconnectMonitor<TcpStream> for TcpAdmissionDisconnectMonitor {
+    async fn disconnected(&self, stream: &TcpStream) -> Result<AdmissionDisconnect, io::Error> {
+        let mut probes = tokio::time::interval(self.probe_interval);
+        probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // Readable Kafka bytes are level-triggered. Pacing before each
+            // readiness inspection prevents a hot loop while still allowing
+            // Tokio's reactor to add a later READ_CLOSED or ERROR state.
+            _ = probes.tick().await;
+            let ready = stream.ready(Interest::READABLE | Interest::ERROR).await?;
+            if let Some(error) = stream.take_error()? {
+                return Ok(AdmissionDisconnect::Socket(error));
+            }
+            if ready.is_read_closed() {
+                return Ok(AdmissionDisconnect::Closed);
+            }
+            if ready.is_error() {
+                return Ok(AdmissionDisconnect::ErrorReady);
+            }
+        }
+    }
 }
 
 /// A separately bounded Kafka protocol I/O phase.
@@ -1453,8 +1554,9 @@ impl<S, State> TcpBytesService<S, State> {
 /// A [`Layer`] that admits a Kafka request after its fixed head is read and
 /// before storage for the complete frame is allocated.
 #[derive(Clone, Debug)]
-pub struct AdmittedTcpBytesLayer<State, P> {
+pub struct AdmittedTcpBytesLayer<State, P, M = NoopAdmissionDisconnectMonitor> {
     policy: P,
+    disconnect_monitor: M,
     _state: PhantomData<State>,
 }
 
@@ -1463,21 +1565,38 @@ impl<State, P> AdmittedTcpBytesLayer<State, P> {
     pub fn new(policy: P) -> Self {
         Self {
             policy,
+            disconnect_monitor: NoopAdmissionDisconnectMonitor,
             _state: PhantomData,
         }
     }
 }
 
-impl<S, State, P> Layer<S> for AdmittedTcpBytesLayer<State, P>
+impl<State, P, M> AdmittedTcpBytesLayer<State, P, M> {
+    /// Observe pending-admission disconnects using a transport-specific monitor.
+    pub fn with_disconnect_monitor<N>(
+        self,
+        disconnect_monitor: N,
+    ) -> AdmittedTcpBytesLayer<State, P, N> {
+        AdmittedTcpBytesLayer {
+            policy: self.policy,
+            disconnect_monitor,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<S, State, P, M> Layer<S> for AdmittedTcpBytesLayer<State, P, M>
 where
     P: Clone,
+    M: Clone,
 {
-    type Service = AdmittedTcpBytesService<S, State, P>;
+    type Service = AdmittedTcpBytesService<S, State, P, M>;
 
     fn layer(&self, inner: S) -> Self::Service {
         AdmittedTcpBytesService {
             inner,
             policy: self.policy.clone(),
+            disconnect_monitor: self.disconnect_monitor.clone(),
             _state: PhantomData,
         }
     }
@@ -1485,9 +1604,10 @@ where
 
 /// A TCP connection service whose request bodies are guarded by a Rama policy.
 #[derive(Clone, Debug)]
-pub struct AdmittedTcpBytesService<S, State, P> {
+pub struct AdmittedTcpBytesService<S, State, P, M = NoopAdmissionDisconnectMonitor> {
     inner: S,
     policy: P,
+    disconnect_monitor: M,
     _state: PhantomData<State>,
 }
 
@@ -1506,7 +1626,7 @@ enum ReadHeadError {
     },
 }
 
-impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
+impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
     async fn read_head<R>(
         &self,
         stream: &mut R,
@@ -1585,6 +1705,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
         S::Error: error::Error + 'static,
         State: Clone + Send + Sync + 'static,
         R: AsyncReadExt + AsyncWriteExt + Unpin,
+        M: AdmissionDisconnectMonitor<R>,
     {
         let (wire_head, length, encoded_head) = self
             .read_head(stream, maximum_frame_size, transport)
@@ -1596,10 +1717,23 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
                     RequestAdmissionError::Timeout { phase, timeout }
                 }
             })?;
-        let (ctx, admitted_head, lease) = self
-            .admit(ctx, wire_head)
-            .await
-            .map_err(RequestAdmissionError::Policy)?;
+        let admitted = {
+            let admission = self.admit(ctx, wire_head);
+            let disconnect = self.disconnect_monitor.disconnected(&*stream);
+            tokio::pin!(admission, disconnect);
+            tokio::select! {
+                result = &mut admission => result.map_err(RequestAdmissionError::Policy)?,
+                result = &mut disconnect => match result {
+                    Ok(disconnect) => {
+                        return Err(RequestAdmissionError::Disconnected(disconnect));
+                    }
+                    Err(error) => {
+                        return Err(RequestAdmissionError::DisconnectMonitor(error));
+                    }
+                },
+            }
+        };
+        let (ctx, admitted_head, lease) = admitted;
 
         // A Rama policy may carry a request through retries, but changing the
         // protocol identity would separate admission from the bytes it guards.
@@ -1661,7 +1795,7 @@ impl<S, State, P> AdmittedTcpBytesService<S, State, P> {
     }
 }
 
-impl<S, State, P, Stream> Service<TcpContext, Stream> for AdmittedTcpBytesService<S, State, P>
+impl<S, State, P, M, Stream> Service<TcpContext, Stream> for AdmittedTcpBytesService<S, State, P, M>
 where
     S: Service<State, AdmittedFrame<P::Guard>, Response = AdmittedReply<P::Guard, Reply>>,
     P: Policy<State, RequestHead>,
@@ -1669,6 +1803,7 @@ where
     S::Error: error::Error + 'static,
     State: Clone + Default + Send + Sync + 'static,
     Stream: AsyncReadExt + AsyncWriteExt + Unpin + Send + Sync + 'static,
+    M: AdmissionDisconnectMonitor<Stream> + Send + Sync + 'static,
 {
     type Response = ();
     type Error = RequestAdmissionError<P::Error, S::Error>;
@@ -1973,9 +2108,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AcceptIntent, AdmissionEvidence, AdmissionLease, AdmittedFrame, AdmittedReply,
-        ConnectionInfo, FixedConnectionPolicy, FrameLength, ProtocolIoPhase, Reply,
-        RequestAdmissionError, RequestHead, SocketOptionTarget, TcpBytesLayer, TcpContext,
+        AcceptIntent, AdmissionDisconnect, AdmissionDisconnectMonitor, AdmissionEvidence,
+        AdmissionLease, AdmittedFrame, AdmittedReply, ConnectionInfo, FixedConnectionPolicy,
+        FrameLength, ProtocolIoPhase, Reply, RequestAdmissionError, RequestHead,
+        SocketOptionTarget, TcpAdmissionDisconnectMonitor, TcpBytesLayer, TcpContext,
         TcpKeepaliveConfig, TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
         configure_admitted_socket,
     };
@@ -1992,6 +2128,60 @@ mod tests {
         started: mpsc::UnboundedSender<RequestHead>,
         drops: Arc<AtomicUsize>,
         abort: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PendingCancellationPolicy {
+        started: mpsc::UnboundedSender<()>,
+        cancelled: Arc<AtomicUsize>,
+    }
+
+    impl Policy<(), RequestHead> for PendingCancellationPolicy {
+        type Guard = RequestLease;
+        type Error = io::Error;
+
+        async fn check(
+            &self,
+            _ctx: Context<()>,
+            _request: RequestHead,
+        ) -> PolicyResult<(), RequestHead, Self::Guard, Self::Error> {
+            let cancellation = DropProbe(self.cancelled.clone());
+            self.started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(cancellation);
+            unreachable!("the cancellation policy never resolves")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct PendingCancellationMonitor {
+        started: mpsc::UnboundedSender<()>,
+        cancelled: Arc<AtomicUsize>,
+    }
+
+    impl<Stream> AdmissionDisconnectMonitor<Stream> for PendingCancellationMonitor
+    where
+        Stream: Sync,
+    {
+        async fn disconnected(&self, _stream: &Stream) -> Result<AdmissionDisconnect, io::Error> {
+            let cancellation = DropProbe(self.cancelled.clone());
+            self.started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(cancellation);
+            unreachable!("the cancellation monitor never resolves")
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FailingDisconnectMonitor;
+
+    impl<Stream> AdmissionDisconnectMonitor<Stream> for FailingDisconnectMonitor
+    where
+        Stream: Sync,
+    {
+        async fn disconnected(&self, _stream: &Stream) -> Result<AdmissionDisconnect, io::Error> {
+            Err(io::Error::other("injected disconnect probe failure"))
+        }
     }
 
     #[derive(Debug)]
@@ -2510,6 +2700,12 @@ mod tests {
             TcpTransportConfig::default().with_response_write_timeout(Duration::ZERO),
             Err(TcpTransportConfigError::ZeroDuration {
                 option: "response write"
+            })
+        ));
+        assert!(matches!(
+            TcpAdmissionDisconnectMonitor::new(Duration::ZERO),
+            Err(TcpTransportConfigError::ZeroDuration {
+                option: "admission disconnect probe"
             })
         ));
     }
@@ -3146,6 +3342,160 @@ mod tests {
             server.await.unwrap(),
             Err(RequestAdmissionError::Io(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn tcp_monitor_observes_fin_behind_queued_bytes_without_consuming_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(local_addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        let gate = Arc::new(Semaphore::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let monitor = TcpAdmissionDisconnectMonitor::new(Duration::from_millis(50)).unwrap();
+        assert_eq!(Duration::from_millis(50), monitor.probe_interval());
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate,
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .with_disconnect_monitor(monitor)
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+
+        let mut request = vec![0xA5; 68];
+        request[..4].copy_from_slice(&64_i32.to_be_bytes());
+        request[4..6].copy_from_slice(&3_i16.to_be_bytes());
+        request[6..8].copy_from_slice(&1_i16.to_be_bytes());
+        request[8..12].copy_from_slice(&91_i32.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+
+        let result = {
+            let admission = service.request(
+                &mut server,
+                Some(64),
+                TcpTransportConfig::default(),
+                Context::with_state(()),
+            );
+            tokio::pin!(admission);
+
+            // Readable body bytes must not create a hot readiness loop or
+            // complete admission observation while the peer remains open.
+            let pending = timeout(Duration::from_millis(125), &mut admission);
+            tokio::pin!(pending);
+            let mut policy_started = false;
+            let pending_result = loop {
+                tokio::select! {
+                    result = &mut pending => break result,
+                    started = started_rx.recv(), if !policy_started => {
+                        let _started = started.unwrap();
+                        policy_started = true;
+                    }
+                }
+            };
+            assert!(policy_started);
+            assert!(pending_result.is_err());
+
+            client.shutdown().await.unwrap();
+            timeout(Duration::from_secs(1), admission)
+                .await
+                .expect("FIN must finish pending-admission observation")
+        };
+
+        assert!(matches!(
+            result,
+            Err(RequestAdmissionError::Disconnected(
+                AdmissionDisconnect::Closed
+            ))
+        ));
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+
+        let mut unread_body = vec![0u8; request.len() - 12];
+        _ = timeout(Duration::from_secs(1), server.read_exact(&mut unread_body))
+            .await
+            .expect("the queued body must remain readable")
+            .unwrap();
+        assert_eq!(&request[12..], unread_body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn disconnect_monitor_failure_is_typed_and_never_creates_a_lease() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, _started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(RequestPolicy {
+                gate: Arc::new(Semaphore::new(0)),
+                started: started_tx,
+                drops: drops.clone(),
+                abort: false,
+            })
+            .with_disconnect_monitor(FailingDisconnectMonitor)
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(64);
+        client
+            .write_all(&[0, 0, 0, 8, 0, 3, 0, 1, 0, 0, 0, 9])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await,
+            Err(RequestAdmissionError::DisconnectMonitor(error))
+                if error.to_string() == "injected disconnect probe failure"
+        ));
+        assert_eq!(0, drops.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_admission_drops_both_pending_futures_without_a_lease() {
+        let policy_cancelled = Arc::new(AtomicUsize::new(0));
+        let monitor_cancelled = Arc::new(AtomicUsize::new(0));
+        let (policy_started_tx, mut policy_started_rx) = mpsc::unbounded_channel();
+        let (monitor_started_tx, mut monitor_started_rx) = mpsc::unbounded_channel();
+        let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
+        let service = TcpBytesLayer::<()>::default()
+            .with_request_policy(PendingCancellationPolicy {
+                started: policy_started_tx,
+                cancelled: policy_cancelled.clone(),
+            })
+            .with_disconnect_monitor(PendingCancellationMonitor {
+                started: monitor_started_tx,
+                cancelled: monitor_cancelled.clone(),
+            })
+            .into_layer(AdmittedEchoService {
+                observed_lease: observed_tx,
+                fail: false,
+            });
+        let (mut client, server) = duplex(64);
+        client
+            .write_all(&[0, 0, 0, 8, 0, 3, 0, 1, 0, 0, 0, 9])
+            .await
+            .unwrap();
+
+        let connection = tokio::spawn(async move {
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await
+        });
+        policy_started_rx.recv().await.unwrap();
+        monitor_started_rx.recv().await.unwrap();
+        connection.abort();
+        assert!(connection.await.unwrap_err().is_cancelled());
+
+        assert_eq!(1, policy_cancelled.load(Ordering::SeqCst));
+        assert_eq!(1, monitor_cancelled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
