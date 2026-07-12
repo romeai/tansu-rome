@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     io::{self, Cursor, Read},
     rc::Rc,
 };
@@ -126,6 +126,26 @@ struct InterruptedOnce<R> {
     interrupted: bool,
 }
 
+#[derive(Debug)]
+struct PointerRecordingReader<R> {
+    inner: R,
+    bulk_output_addresses: Rc<RefCell<Vec<usize>>>,
+}
+
+impl<R> Read for PointerRecordingReader<R>
+where
+    R: Read,
+{
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.len() > 1 {
+            self.bulk_output_addresses
+                .borrow_mut()
+                .push(output.as_ptr() as usize);
+        }
+        self.inner.read(output)
+    }
+}
+
 impl<R> Read for InterruptedOnce<R>
 where
     R: Read,
@@ -160,11 +180,13 @@ fn lends_null_empty_and_present_values_while_streaming_other_fields()
     ];
     let encoded = records.as_slice().encode()?;
     let mut scratch = [0u8; 16];
+    let mut transfer = [0u8; 32];
     let scratch_start = scratch.as_ptr() as usize;
     let scratch_end = scratch_start + scratch.len();
     let mut values = ValueRecords::new(
         Cursor::new(encoded.clone()),
         &mut scratch,
+        &mut transfer,
         3,
         limits(encoded.len(), 16),
     )?;
@@ -205,10 +227,72 @@ fn arbitrary_short_reads_do_not_change_the_wire_grammar() -> Result<(), Box<dyn 
         max_read: 3,
     };
     let mut scratch = [0u8; 4];
-    let mut values = ValueRecords::new(reader, &mut scratch, 1, limits(encoded.len(), 4))?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits(encoded.len(), 4),
+    )?;
     assert_eq!(Some(ValueRef::Bytes(&b"kept"[..])), values.next_value()?);
     assert_eq!(None, values.next_value()?);
     let _ = values.finish()?;
+    Ok(())
+}
+
+#[test]
+fn caller_transfer_scratch_is_reused_across_fields_records_and_eof()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut records = vec![
+        Record::builder()
+            .key(Some(Bytes::from(vec![1; 20])))
+            .value(None)
+            .build()?,
+        Record::builder()
+            .key(Some(Bytes::from(vec![2; 20])))
+            .value(None)
+            .build()?,
+    ];
+    for record in &mut records {
+        set_headers(
+            record,
+            vec![Header {
+                key: Some(Bytes::from(vec![3; 10])),
+                value: Some(Bytes::from(vec![4; 12])),
+            }],
+        )?;
+    }
+    let encoded = records.as_slice().encode()?;
+    let addresses = Rc::new(RefCell::new(Vec::new()));
+    let reader = PointerRecordingReader {
+        inner: Cursor::new(encoded.clone()),
+        bulk_output_addresses: Rc::clone(&addresses),
+    };
+    let mut scratch = [];
+    let mut transfer = [0u8; 7];
+    let transfer_address = transfer.as_ptr() as usize;
+    let mut values = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        2,
+        limits(encoded.len(), 0),
+    )?;
+    assert_eq!(Some(ValueRef::Null), values.next_value()?);
+    assert_eq!(Some(ValueRef::Null), values.next_value()?);
+    assert_eq!(None, values.next_value()?);
+    let _ = values.finish()?;
+
+    let addresses = addresses.borrow();
+    assert!(
+        addresses.len() > 6,
+        "multiple transfer chunks were observed"
+    );
+    assert!(
+        addresses.iter().all(|address| *address == transfer_address),
+        "every bulk skip and EOF read reused the caller's one transfer buffer"
+    );
     Ok(())
 }
 
@@ -224,7 +308,14 @@ fn interrupted_reads_are_retried_without_losing_progress() -> Result<(), Box<dyn
         interrupted: false,
     };
     let mut scratch = [0u8; 16];
-    let mut values = ValueRecords::new(reader, &mut scratch, 1, limits(encoded.len(), 16))?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits(encoded.len(), 16),
+    )?;
     assert_eq!(
         Some(ValueRef::Bytes(&b"after-interrupt"[..])),
         values.next_value()?
@@ -238,7 +329,14 @@ fn interrupted_reads_are_retried_without_losing_progress() -> Result<(), Box<dyn
 #[test]
 fn zero_count_and_invalid_declared_counts_are_exact() -> Result<(), Box<dyn std::error::Error>> {
     let mut scratch = [];
-    let mut empty = ValueRecords::new(Cursor::new(Bytes::new()), &mut scratch, 0, limits(0, 0))?;
+    let mut transfer = [0u8; 32];
+    let mut empty = ValueRecords::new(
+        Cursor::new(Bytes::new()),
+        &mut scratch,
+        &mut transfer,
+        0,
+        limits(0, 0),
+    )?;
     assert_eq!(None, empty.next_value()?);
     let (_, progress) = empty.finish()?;
     assert_eq!(
@@ -250,9 +348,11 @@ fn zero_count_and_invalid_declared_counts_are_exact() -> Result<(), Box<dyn std:
     );
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut trailing = ValueRecords::new(
         Cursor::new(Bytes::from_static(b"x")),
         &mut scratch,
+        &mut transfer,
         0,
         limits(1, 0),
     )?;
@@ -263,8 +363,15 @@ fn zero_count_and_invalid_declared_counts_are_exact() -> Result<(), Box<dyn std:
     assert_eq!(1, trailing.progress().decoded_bytes);
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     assert!(matches!(
-        ValueRecords::new(Cursor::new(Bytes::new()), &mut scratch, -1, limits(0, 0),),
+        ValueRecords::new(
+            Cursor::new(Bytes::new()),
+            &mut scratch,
+            &mut transfer,
+            -1,
+            limits(0, 0),
+        ),
         Err(RecordDecodeError::NegativeLength {
             field: "record count",
             actual: -1,
@@ -272,10 +379,17 @@ fn zero_count_and_invalid_declared_counts_are_exact() -> Result<(), Box<dyn std:
     ));
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut count_limits = limits(0, 0);
     count_limits.max_records = 1;
     assert!(matches!(
-        ValueRecords::new(Cursor::new(Bytes::new()), &mut scratch, 2, count_limits,),
+        ValueRecords::new(
+            Cursor::new(Bytes::new()),
+            &mut scratch,
+            &mut transfer,
+            2,
+            count_limits,
+        ),
         Err(RecordDecodeError::LimitExceeded {
             kind: RecordDecodeLimit::Records,
             limit: 1,
@@ -297,7 +411,14 @@ fn reader_errors_are_typed_sticky_and_preserve_exact_progress()
         bytes_before_error: 6,
     };
     let mut scratch = [0u8; 32];
-    let mut values = ValueRecords::new(reader, &mut scratch, 1, limits(encoded.len(), 32))?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits(encoded.len(), 32),
+    )?;
     let expected = RecordDecodeError::ReaderIo {
         field: "value",
         kind: io::ErrorKind::ConnectionReset,
@@ -334,10 +455,12 @@ fn scratch_and_field_bombs_fail_at_the_configured_boundaries()
     let encoded = (&[record][..]).encode()?;
     let exact_limits = limits(encoded.len(), 8);
     let mut too_small = [0u8; 7];
+    let mut transfer = [0u8; 32];
     assert!(matches!(
         ValueRecords::new(
             Cursor::new(encoded.clone()),
             &mut too_small,
+            &mut transfer,
             1,
             exact_limits
         ),
@@ -348,7 +471,27 @@ fn scratch_and_field_bombs_fail_at_the_configured_boundaries()
     ));
 
     let mut exact = [0u8; 8];
-    let mut values = ValueRecords::new(Cursor::new(encoded.clone()), &mut exact, 1, exact_limits)?;
+    let mut empty_transfer = [];
+    assert!(matches!(
+        ValueRecords::new(
+            Cursor::new(encoded.clone()),
+            &mut exact,
+            &mut empty_transfer,
+            1,
+            exact_limits,
+        ),
+        Err(RecordDecodeError::TransferScratchEmpty)
+    ));
+
+    let mut exact = [0u8; 8];
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        Cursor::new(encoded.clone()),
+        &mut exact,
+        &mut transfer,
+        1,
+        exact_limits,
+    )?;
     assert_eq!(
         Some(ValueRef::Bytes(&b"12345678"[..])),
         values.next_value()?
@@ -356,9 +499,11 @@ fn scratch_and_field_bombs_fail_at_the_configured_boundaries()
     assert_eq!(None, values.next_value()?);
 
     let mut limited = [0u8; 7];
+    let mut transfer = [0u8; 32];
     let mut values = ValueRecords::new(
         Cursor::new(encoded.clone()),
         &mut limited,
+        &mut transfer,
         1,
         limits(encoded.len(), 7),
     )?;
@@ -377,7 +522,14 @@ fn scratch_and_field_bombs_fail_at_the_configured_boundaries()
     decoded_limited.max_decoded_bytes -= 1;
     decoded_limited.max_record_bytes = decoded_limited.max_decoded_bytes;
     let mut scratch = [0u8; 8];
-    let mut values = ValueRecords::new(Cursor::new(encoded), &mut scratch, 1, decoded_limited)?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        Cursor::new(encoded),
+        &mut scratch,
+        &mut transfer,
+        1,
+        decoded_limited,
+    )?;
     assert!(matches!(
         values.next_value(),
         Err(RecordDecodeError::LimitExceeded {
@@ -410,8 +562,14 @@ fn cumulative_header_and_work_budgets_include_the_failing_attempt()
     let mut header_limits = limits(encoded.len(), 0);
     header_limits.max_headers = 1;
     let mut scratch = [];
-    let mut values =
-        ValueRecords::new(Cursor::new(encoded.clone()), &mut scratch, 1, header_limits)?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        Cursor::new(encoded.clone()),
+        &mut scratch,
+        &mut transfer,
+        1,
+        header_limits,
+    )?;
     assert_eq!(
         RecordDecodeError::LimitExceeded {
             kind: RecordDecodeLimit::Headers,
@@ -449,8 +607,14 @@ fn cumulative_header_and_work_budgets_include_the_failing_attempt()
         ),
     ] {
         let mut scratch = [];
-        let mut values =
-            ValueRecords::new(Cursor::new(encoded.clone()), &mut scratch, 1, field_limits)?;
+        let mut transfer = [0u8; 32];
+        let mut values = ValueRecords::new(
+            Cursor::new(encoded.clone()),
+            &mut scratch,
+            &mut transfer,
+            1,
+            field_limits,
+        )?;
         assert_eq!(expected, values.next_value().expect_err("header field cap"));
         assert_eq!(2, values.progress().headers_declared);
         assert_eq!(1, values.progress().records_begun);
@@ -460,7 +624,14 @@ fn cumulative_header_and_work_budgets_include_the_failing_attempt()
     let mut work_limits = limits(encoded.len(), 0);
     work_limits.max_work_units = 1;
     let mut scratch = [];
-    let mut values = ValueRecords::new(Cursor::new(encoded), &mut scratch, 1, work_limits)?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(
+        Cursor::new(encoded),
+        &mut scratch,
+        &mut transfer,
+        1,
+        work_limits,
+    )?;
     assert_eq!(
         RecordDecodeError::LimitExceeded {
             kind: RecordDecodeLimit::WorkUnits,
@@ -486,22 +657,36 @@ fn eof_probe_reader_errors_propagate_from_next_and_finish() -> Result<(), Box<dy
     };
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let reader = ErrorReader {
         inner: Cursor::new(encoded.clone()),
         bytes_before_error: encoded.len(),
     };
-    let mut next = ValueRecords::new(reader, &mut scratch, 1, limits(encoded.len(), 0))?;
+    let mut next = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits(encoded.len(), 0),
+    )?;
     assert_eq!(Some(ValueRef::Null), next.next_value()?);
     assert_eq!(expected, next.next_value().expect_err("next EOF probe"));
     assert_eq!(encoded.len(), next.progress().decoded_bytes);
     assert_eq!(1, next.progress().records_emitted);
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let reader = ErrorReader {
         inner: Cursor::new(encoded.clone()),
         bytes_before_error: encoded.len(),
     };
-    let mut finish = ValueRecords::new(reader, &mut scratch, 1, limits(encoded.len(), 0))?;
+    let mut finish = ValueRecords::new(
+        reader,
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits(encoded.len(), 0),
+    )?;
     assert_eq!(Some(ValueRef::Null), finish.next_value()?);
     let failure = finish.finish().expect_err("finish EOF probe");
     assert_eq!(&expected, failure.error());
@@ -535,7 +720,8 @@ fn underlying_reads_cannot_overshoot_the_decoded_budget_by_more_than_one_byte()
     let mut decode_limits = limits(decoded_limit, 80);
     decode_limits.max_record_bytes = decoded_limit;
     let mut scratch = [0u8; 80];
-    let mut values = ValueRecords::new(reader, &mut scratch, 2, decode_limits)?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(reader, &mut scratch, &mut transfer, 2, decode_limits)?;
     assert!(matches!(values.next_value()?, Some(ValueRef::Bytes(_))));
     assert!(matches!(
         values.next_value(),
@@ -565,7 +751,8 @@ fn underlying_reads_cannot_overshoot_the_decoded_budget_by_more_than_one_byte()
     let mut decode_limits = limits(decoded_limit, 0);
     decode_limits.max_record_bytes = decoded_limit;
     let mut scratch = [];
-    let mut values = ValueRecords::new(reader, &mut scratch, 0, decode_limits)?;
+    let mut transfer = [0u8; 32];
+    let mut values = ValueRecords::new(reader, &mut scratch, &mut transfer, 0, decode_limits)?;
     assert!(matches!(
         values.next_value(),
         Err(RecordDecodeError::LimitExceeded {
@@ -583,9 +770,11 @@ fn underlying_reads_cannot_overshoot_the_decoded_budget_by_more_than_one_byte()
 fn required_header_keys_reject_kafkas_null_sentinel() -> Result<(), Box<dyn std::error::Error>> {
     let encoded = Bytes::from_static(b"\x0e\x00\x00\x00\x01\x01\x02\x01");
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut values = ValueRecords::new(
         Cursor::new(encoded.clone()),
         &mut scratch,
+        &mut transfer,
         1,
         limits(encoded.len(), 0),
     )?;
@@ -623,9 +812,11 @@ fn malformed_lengths_counts_bodies_and_trailing_bytes_fail_loudly()
         ),
     ] {
         let mut scratch = [0u8; 1];
+        let mut transfer = [0u8; 32];
         let mut values = ValueRecords::new(
             Cursor::new(encoded.clone()),
             &mut scratch,
+            &mut transfer,
             1,
             limits(encoded.len(), 1),
         )?;
@@ -638,9 +829,11 @@ fn malformed_lengths_counts_bodies_and_trailing_bytes_fail_loudly()
     extended[0] = extended[0].checked_add(2).expect("small record length");
     extended.extend_from_slice(&[0]);
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut values = ValueRecords::new(
         Cursor::new(extended.clone()),
         &mut scratch,
+        &mut transfer,
         1,
         limits(extended.len(), 0),
     )?;
@@ -650,9 +843,11 @@ fn malformed_lengths_counts_bodies_and_trailing_bytes_fail_loudly()
     ));
 
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut missing = ValueRecords::new(
         Cursor::new(encoded.clone()),
         &mut scratch,
+        &mut transfer,
         2,
         limits(encoded.len(), 0),
     )?;
@@ -668,9 +863,11 @@ fn malformed_lengths_counts_bodies_and_trailing_bytes_fail_loudly()
     let mut two = BytesMut::from(&encoded[..]);
     two.extend_from_slice(&encoded);
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut trailing = ValueRecords::new(
         Cursor::new(two.clone()),
         &mut scratch,
+        &mut transfer,
         1,
         limits(two.len(), 0),
     )?;
@@ -691,9 +888,11 @@ fn finish_is_mandatory_for_early_termination() -> Result<(), Box<dyn std::error:
     ];
     let encoded = records.as_slice().encode()?;
     let mut scratch = [];
+    let mut transfer = [0u8; 32];
     let mut values = ValueRecords::new(
         Cursor::new(encoded.clone()),
         &mut scratch,
+        &mut transfer,
         2,
         limits(encoded.len(), 0),
     )?;

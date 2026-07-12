@@ -225,6 +225,10 @@ pub enum RecordDecodeError {
     /// Caller-owned fixed scratch cannot retain the configured maximum selected value.
     #[error("value scratch has {actual} bytes but record limits require {required}")]
     ScratchTooSmall { required: usize, actual: usize },
+    /// Caller-owned transfer scratch must make forward progress while skipping fields or probing
+    /// EOF; requiring one byte avoids hidden allocation and a zero-capacity read loop.
+    #[error("record transfer scratch must not be empty")]
+    TransferScratchEmpty,
     /// The caller-supplied decompressed reader failed.
     #[error("record reader failed while decoding {field} with {kind:?}")]
     ReaderIo {
