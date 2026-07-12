@@ -19,7 +19,8 @@
 //! compatibility requirements. Existing owned record inflation remains unchanged.
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Read},
     num::{NonZeroU64, NonZeroUsize},
 };
 
@@ -34,6 +35,63 @@ pub use gzip::GzipDecoder;
 pub use lz4::Lz4Decoder;
 pub use snappy::XerialSnappyDecoder;
 pub use zstd::ZstdDecoder;
+
+/// Stack-dispatched reader for Kafka's four compressed record-data encodings.
+///
+/// This enum deliberately has no uncompressed variant. Callers must branch on the batch
+/// compression bits and pass uncompressed record data directly to the record parser, making it
+/// structurally impossible for this adapter to obscure whether decompression limits apply. The
+/// concrete variants avoid a boxed reader and preserve each codec's explicit construction policy.
+pub enum CompressedRecordDataDecoder<'data, 'scratch> {
+    /// One exact RFC 1952 stream, including any concatenated members.
+    Gzip(GzipDecoder<'data>),
+    /// Kafka's Xerial framing over raw Snappy blocks and caller-owned block scratch.
+    XerialSnappy(XerialSnappyDecoder<'data, 'scratch>),
+    /// Exactly one structurally preflighted LZ4 frame.
+    Lz4(Lz4Decoder<'data>),
+    /// Exactly one non-dictionary Zstandard frame.
+    Zstd(ZstdDecoder<'data>),
+}
+
+impl<'data, 'scratch> CompressedRecordDataDecoder<'data, 'scratch> {
+    /// Construct the gzip variant after allocation-free envelope validation.
+    pub fn gzip(encoded: &'data [u8]) -> Result<Self, CompressionDecodeError> {
+        GzipDecoder::new(encoded).map(Self::Gzip)
+    }
+
+    /// Construct the Xerial Snappy variant after validating all blocks and caller scratch.
+    pub fn xerial_snappy(
+        encoded: &'data [u8],
+        scratch: &'scratch mut [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        XerialSnappyDecoder::new(encoded, scratch, limit).map(Self::XerialSnappy)
+    }
+
+    /// Construct the LZ4 variant after exact structural and block-state preflight.
+    pub fn lz4(encoded: &'data [u8], limit: Lz4BlockLimit) -> Result<Self, CompressionDecodeError> {
+        Lz4Decoder::new(encoded, limit).map(Self::Lz4)
+    }
+
+    /// Construct the Zstandard variant after exact-frame and exact-window preflight.
+    pub fn zstd(
+        encoded: &'data [u8],
+        limit: ZstdWindowLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        ZstdDecoder::new(encoded, limit).map(Self::Zstd)
+    }
+}
+
+impl Read for CompressedRecordDataDecoder<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Gzip(decoder) => decoder.read(output),
+            Self::XerialSnappy(decoder) => decoder.read(output),
+            Self::Lz4(decoder) => decoder.read(output),
+            Self::Zstd(decoder) => decoder.read(output),
+        }
+    }
+}
 
 /// Zstandard's backend minimum window-log parameter; exact preflight may enforce a smaller
 /// single-segment byte ceiling, but the native decoder still retains at least this state class.
