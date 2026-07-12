@@ -149,6 +149,7 @@
 //! ```
 pub mod borrowed;
 pub(crate) mod codec;
+pub mod compression;
 pub mod deflated;
 pub mod header;
 pub mod inflated;
