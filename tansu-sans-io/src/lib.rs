@@ -117,6 +117,7 @@
 //! map from the [Serde Data Model](https://serde.rs/data-model.html) to the Kafka protocol or vice versa.
 
 pub mod acl;
+mod borrowed;
 pub mod consumer;
 pub mod de;
 pub mod primitive;
@@ -700,7 +701,7 @@ impl Frame {
     /// value are checked before the decoder allocates or traverses that value.
     #[instrument(skip_all)]
     pub fn request_from_bytes_with_limits(
-        mut encoded: impl Buf,
+        encoded: impl Buf,
         limits: DecodeLimits,
     ) -> Result<Frame> {
         let start = SystemTime::now();

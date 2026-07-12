@@ -6214,7 +6214,8 @@ fn describe_configs_request_decodes_non_empty_primitive_string_sequences() -> Re
                 max_bytes: frame_bytes,
                 max_sequence_elements: frame_bytes,
                 max_nesting_depth: 16,
-                max_work_units: frame_bytes * 8 + 256,
+                max_total_allocation_bytes: frame_bytes * 8 + 256,
+                max_total_work_units: frame_bytes * 8 + 256,
             },
         )?;
         let decoded = DescribeConfigsRequest::try_from(decoded.body)?;

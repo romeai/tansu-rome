@@ -18,7 +18,7 @@ use crate::{
         TAG_BUFFER_FIELDS_FIELD, TAG_BUFFER_WIRE_NAME, TAG_FIELD_DATA_FIELD, TAG_FIELD_WIRE_NAME,
     },
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use serde::{
     Deserializer,
     de::{DeserializeSeed, EnumAccess, SeqAccess, VariantAccess, Visitor},
@@ -1712,8 +1712,9 @@ mod tests {
     #[test]
     fn bounded_sequence_reports_its_exact_remaining_capacity() {
         let mut encoded = &[][..];
-        let mut decoder = Decoder::request_with_limits(&mut encoded, DecodeLimits::default())
-            .expect("default limits are valid");
+        let mut decoder =
+            Decoder::request_with_limits(&mut encoded, DecodeLimits::default(), None, 0)
+                .expect("default limits are valid");
         let sequence = Seq::new(&mut decoder, Some(17));
         assert_eq!(sequence.size_hint(), Some(17));
     }
