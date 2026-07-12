@@ -259,7 +259,13 @@ impl<'de> Decoder<'de> {
             self.is_valid(),
         );
 
-        if self.in_header() || self.is_nullable() || !self.is_valid() {
+        // Once a primitive sequence has consumed its nullable array length,
+        // element strings are mandatory values. The field metadata still
+        // describes the enclosing nullable array, so applying its nullability
+        // here would skip every element's own length and desynchronize the
+        // decoder before allocation limits can protect the payload.
+        if self.in_header() || (self.is_nullable() && !self.in_seq_of_primitive) || !self.is_valid()
+        {
             debug!(
                 "field: {} is not a mandatory non nullable length",
                 self.field_name()

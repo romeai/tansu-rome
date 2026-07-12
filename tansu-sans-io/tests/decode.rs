@@ -6175,3 +6175,55 @@ fn describe_topic_partitions_response_v0_000() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn describe_configs_request_decodes_non_empty_primitive_string_sequences() -> Result<()> {
+    use tansu_sans_io::{
+        DecodeLimits, DescribeConfigsRequest, describe_configs_request::DescribeConfigsResource,
+    };
+
+    let _guard = init_tracing()?;
+    for api_version in [0, 4] {
+        let encoded = Frame::request(
+            Header::Request {
+                api_key: DescribeConfigsRequest::KEY,
+                api_version,
+                correlation_id: 13,
+                client_id: Some("adminclient-1".into()),
+            },
+            DescribeConfigsRequest::default()
+                .resources(Some(
+                    [DescribeConfigsResource::default()
+                        .resource_type(2)
+                        .resource_name("orders".into())
+                        .configuration_keys(Some(
+                            ["cleanup.policy".into(), "retention.ms".into()].into(),
+                        ))]
+                    .into(),
+                ))
+                .include_synonyms(Some(false))
+                .include_documentation(Some(false))
+                .into(),
+        )?;
+        let frame_bytes = encoded.len();
+        let decoded = Frame::request_from_bytes_with_limits(
+            encoded,
+            DecodeLimits {
+                max_frame_bytes: frame_bytes,
+                max_string_bytes: frame_bytes,
+                max_bytes: frame_bytes,
+                max_sequence_elements: frame_bytes,
+                max_nesting_depth: 16,
+                max_work_units: frame_bytes * 8 + 256,
+            },
+        )?;
+        let decoded = DescribeConfigsRequest::try_from(decoded.body)?;
+        assert_eq!(
+            decoded.resources.unwrap()[0].configuration_keys.as_deref(),
+            Some(&["cleanup.policy".to_owned(), "retention.ms".to_owned()][..]),
+            "DescribeConfigs v{api_version}"
+        );
+    }
+
+    Ok(())
+}
