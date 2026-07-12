@@ -125,6 +125,7 @@ pub mod record;
 pub mod resource;
 pub mod ser;
 
+pub use borrowed::{BorrowedRequestDecodeOptions, RecordSetValidation};
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
 use flate2::read::GzDecoder;

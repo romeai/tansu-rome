@@ -27,6 +27,40 @@ use crate::{DecodeLimit, DecodeLimits, Error, Result};
 /// Width of Kafka's signed frame-length prefix.
 const FRAME_LENGTH_BYTES: usize = size_of::<i32>();
 
+/// Timing of magic-v2 record-set validation in generated borrowed requests.
+///
+/// Request envelope decoding always validates every length, collection boundary, string, tag, and
+/// exact frame boundary. This option controls only the semantically separate record-set scan.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RecordSetValidation {
+    /// Validate every record-set boundary, magic byte, count, and CRC while constructing the root
+    /// request. This preserves the original fail-fast behavior and one cumulative request budget.
+    #[default]
+    Eager,
+    /// Treat record fields as bounded opaque bytes during root construction and validate one field
+    /// when its generated `records()` accessor is called. This lets embedders isolate failures by
+    /// partition; each accessor owns a fresh record-set budget derived from [`DecodeLimits`].
+    OnAccess,
+}
+
+/// Decode policy for a generated frame-backed request containing record fields.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BorrowedRequestDecodeOptions {
+    /// Bounds for the exact request envelope and any eager or on-access record-set validation.
+    pub limits: DecodeLimits,
+    /// Point at which opaque record-set bytes become a validated [`crate::record::borrowed::RecordSet`].
+    pub record_sets: RecordSetValidation,
+}
+
+impl Default for BorrowedRequestDecodeOptions {
+    fn default() -> Self {
+        Self {
+            limits: DecodeLimits::default(),
+            record_sets: RecordSetValidation::Eager,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RequestHead {
     pub(crate) api_version: i16,
@@ -96,13 +130,14 @@ impl DecodeBudget {
 impl<'a> Cursor<'a> {
     pub(crate) fn request(
         frame: &'a Bytes,
-        limits: DecodeLimits,
+        options: BorrowedRequestDecodeOptions,
         expected_api_key: i16,
         min_version: i16,
         max_version: i16,
         flexible_start: i16,
         flexible_end: i16,
     ) -> Result<(RequestHead, Self)> {
+        let limits = options.limits;
         limits.validate()?;
         check_limit(DecodeLimit::FrameBytes, limits.max_frame_bytes, frame.len())?;
         if frame.len() < FRAME_LENGTH_BYTES {
@@ -125,7 +160,7 @@ impl<'a> Cursor<'a> {
             });
         }
 
-        let mut cursor = Self::validating(frame, limits, FRAME_LENGTH_BYTES);
+        let mut cursor = Self::validating(frame, limits, FRAME_LENGTH_BYTES, options.record_sets);
         let api_key = cursor.i16()?;
         if api_key != expected_api_key {
             return Err(Error::NoSuchRequest(api_key));
@@ -163,12 +198,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    fn validating(bytes: &'a [u8], limits: DecodeLimits, position: usize) -> Self {
+    fn validating(
+        bytes: &'a [u8],
+        limits: DecodeLimits,
+        position: usize,
+        record_sets: RecordSetValidation,
+    ) -> Self {
         Self {
             bytes,
             budget: DecodeBudget::new(limits),
             position,
-            validate_record_sets: true,
+            validate_record_sets: record_sets == RecordSetValidation::Eager,
         }
     }
 
