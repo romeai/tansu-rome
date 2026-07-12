@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{DecodeLimit, DecodeLimits, Error, Result, RootMessageMeta};
+use crate::{
+    DecodeLimit, DecodeLimits, Error, Result, RootMessageMeta,
+    primitive::tagged::{
+        TAG_BUFFER_FIELDS_FIELD, TAG_BUFFER_WIRE_NAME, TAG_FIELD_DATA_FIELD, TAG_FIELD_WIRE_NAME,
+    },
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{
     Deserializer,
@@ -351,6 +356,14 @@ impl<'de> Decoder<'de> {
 
     fn is_records(&self) -> bool {
         self.meta.field.is_some_and(|field| field.kind.is_records())
+    }
+
+    fn in_private_wire_field(&self, structure: &'static str, field: &'static str) -> bool {
+        matches!(
+            (self.containers.front(), self.field),
+            (Some(Container::Struct { name, .. }), Some(found))
+                if *name == structure && found == field
+        )
     }
 
     #[must_use]
@@ -790,7 +803,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
             debug!("struct: {:?}, field: {}", self.containers.front(), field);
         }
 
-        let length = if self.is_flexible() {
+        let length = if self.in_private_wire_field(TAG_FIELD_WIRE_NAME, TAG_FIELD_DATA_FIELD) {
+            self.unsigned_varint()
+                .and_then(|length| usize::try_from(length).map_err(Into::into))?
+        } else if self.is_flexible() {
             self.unsigned_varint()
                 .and_then(|length| usize::try_from(length).map_err(Into::into))
                 .and_then(|length| length.checked_sub(1).ok_or(Error::Overflow))?
@@ -973,6 +989,14 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
     where
         V: Visitor<'de>,
     {
+        if self.in_private_wire_field(TAG_BUFFER_WIRE_NAME, TAG_BUFFER_FIELDS_FIELD) {
+            let length = self
+                .unsigned_varint()
+                .and_then(|length| usize::try_from(length).map_err(Into::into))?;
+            self.check_sequence_length(length)?;
+            self.length = Some(length);
+        }
+
         debug!(
             visitor = type_name::<V>(),
             type_name = type_name::<V::Value>(),
@@ -1515,6 +1539,10 @@ impl<'de, 'a> Seq<'de, 'a> {
 impl<'de> SeqAccess<'de> for Seq<'de, '_> {
     type Error = Error;
 
+    fn size_hint(&self) -> Option<usize> {
+        self.length
+    }
+
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
     where
         T: DeserializeSeed<'de>,
@@ -1657,5 +1685,19 @@ impl<'de> VariantAccess<'de> for Enum<'de, '_> {
             visitor = type_name_of_val(&visitor)
         );
         Deserializer::deserialize_struct(self.de, self.name, fields, visitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_sequence_reports_its_exact_remaining_capacity() {
+        let mut encoded = &[][..];
+        let mut decoder = Decoder::request_with_limits(&mut encoded, DecodeLimits::default())
+            .expect("default limits are valid");
+        let sequence = Seq::new(&mut decoder, Some(17));
+        assert_eq!(sequence.size_hint(), Some(17));
     }
 }
