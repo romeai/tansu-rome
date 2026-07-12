@@ -107,7 +107,7 @@ and zero hidden response buffering.
 | Commit | Robustness value and why it is needed | Defaults / Rome status | Depends on | Upstream |
 | --- | --- | --- | --- | --- |
 | `1911c7b`<br>`1911c7b049f09eb88ef056a306a726507d634dd6` | Defines explicit typed Snappy-block, LZ4-block, and exact Zstd-window ceilings before native decoder construction. | No aggregate policy or permissive `Default`; existing inflation unchanged. **Direct.** | — | Issue TBD / PR TBD |
-| `d5f07dc`<br>`d5f07dc44bd6d3062d3000c06a632fe6f5906e3e` | Streams allocation-free RFC 1952 envelopes, including concatenated members, and verifies per-member CRC/ISIZE plus exact final EOF. | Additive gzip reader; owned/default compression unchanged. **Direct.** | `076846f` | Issue TBD / PR TBD |
+| `d5f07dc`<br>`d5f07dc44bd6d3062d3000c06a632fe6f5906e3e` | Streams allocation-free RFC 1952 envelopes, including concatenated members, and verifies per-member CRC/ISIZE plus exact final EOF. | Additive gzip reader; owned/default compression unchanged. **Direct.** | `1911c7b`, `076846f` | Issue TBD / PR TBD |
 | `cc08ee7`<br>`cc08ee7bcad1a2c5d037fd1b1ed4047da84149e0` | Preflights every Xerial block before output and reuses caller scratch, preventing a late oversized block after earlier values were emitted. | Additive reader; existing Snappy path unchanged. **Direct.** | `1911c7b`, `076846f` | Issue TBD / PR TBD |
 | `9e73b09`<br>`9e73b097863a0bb41aa7b7685551a04c3158ce4b` | Preflights the complete LZ4 frame, exact end marker/checksums, block ceiling, and linked-history mode before backend allocation. | Additive reader; existing LZ4 path unchanged. **Direct.** | `1911c7b`, `076846f` | Issue TBD / PR TBD |
 | `c32bf6e`<br>`c32bf6e39a6a6df4288a48f7e2d7d91d5fc940d8` | Admits exact Zstd window bytes and one exact non-dictionary/non-skippable frame, avoiding backend-log rounding and hidden input buffering. | Additive reader; existing Zstd path unchanged. **Direct.** | `1911c7b`, `076846f` | Issue TBD / PR TBD |
@@ -117,6 +117,13 @@ and zero hidden response buffering.
 terminal corruption through both `next_value` and `finish`; gzip additionally
 covers concatenated members and header/trailer integrity; Snappy, LZ4, and Zstd
 cover exact structural and configured state limits.
+
+**Known follow-up:** the LZ4 and Zstandard adapters bound and preflight native
+state, but currently normalize runtime backend read failures to invalid data. A
+genuine lazy native allocation failure can therefore be diagnosed as corrupt
+peer input. This does not weaken the state bound or sticky failure behavior;
+upstream error typing should distinguish that local failure without adding a
+second decoder path.
 
 ## Milestone verification
 
