@@ -189,8 +189,14 @@ fn assert_adapter_error_parity(
     );
 
     let mut scratch = vec![0u8; limits.max_value_bytes];
-    let mut streaming =
-        ValueRecords::new(Cursor::new(record_data), &mut scratch, record_count, limits)?;
+    let mut transfer = [0u8; 32];
+    let mut streaming = ValueRecords::new(
+        Cursor::new(record_data),
+        &mut scratch,
+        &mut transfer,
+        record_count,
+        limits,
+    )?;
     assert_eq!(
         expected,
         streaming.next_value().expect_err("streaming adapter error")
@@ -249,6 +255,47 @@ fn borrowed_and_streaming_adapters_share_exact_grammar_errors()
             actual: declared_body,
         },
     )?;
+    Ok(())
+}
+
+#[test]
+fn borrowed_and_streaming_adapters_charge_empty_fields_consistently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut record = Record::builder()
+        .key(Some(Bytes::new()))
+        .value(Some(Bytes::new()))
+        .build()?;
+    set_headers(
+        &mut record,
+        vec![Header {
+            key: Some(Bytes::new()),
+            value: Some(Bytes::new()),
+        }],
+    )?;
+    let record_data = (&[record][..]).encode()?;
+    let limits = parity_limits(record_data.len());
+    let encoded = encoded_batch_with_data(1, record_data.clone())?;
+    let set = RecordSet::from_bytes(&encoded)?;
+    let batch = set.batches().next().expect("batch");
+    let mut borrowed = batch.records_with_limits(limits)?;
+    let _ = borrowed.next_record()?.expect("borrowed record");
+    assert!(borrowed.next_record()?.is_none());
+    let borrowed_progress = borrowed.finish()?;
+
+    let mut scratch = vec![0u8; limits.max_value_bytes];
+    let mut transfer = [0u8; 3];
+    let mut streaming = ValueRecords::new(
+        Cursor::new(record_data),
+        &mut scratch,
+        &mut transfer,
+        1,
+        limits,
+    )?;
+    let _ = streaming.next_value()?.expect("streamed value");
+    assert!(streaming.next_value()?.is_none());
+    let (_, streaming_progress) = streaming.finish()?;
+
+    assert_eq!(borrowed_progress, streaming_progress);
     Ok(())
 }
 

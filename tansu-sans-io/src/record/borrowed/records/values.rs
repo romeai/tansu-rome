@@ -22,10 +22,6 @@ use super::{
     decode_varint_i64, parse_record_fields,
 };
 
-/// One reused eight-KiB stack chunk bounds per-decoder stack footprint while amortizing reader
-/// calls for arbitrary-size skipped fields and EOF draining; it is not a field-size limit.
-const STREAM_CHUNK_BYTES: usize = 8 * 1024;
-
 /// One selected record value borrowed from caller-owned fixed scratch.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ValueRef<'scratch> {
@@ -48,8 +44,11 @@ impl<'scratch> ValueRef<'scratch> {
 /// Lending value projection over a generic already-decompressed record-stream reader.
 ///
 /// Only the selected value is copied, into the fixed scratch supplied by the caller. Keys and
-/// headers are validated and skipped through a fixed stack chunk. `next_value` lends scratch, so
-/// the reader cannot advance while a selected value remains live.
+/// headers are validated and skipped through separate nonempty transfer scratch supplied by the
+/// caller and reused across every field, record, and EOF drain. Keeping both buffers caller-owned
+/// makes the complete fixed memory cost explicit to an embedder and avoids placing a hidden buffer
+/// in an async future. Transfer scratch size controls read-call amortization, not field limits.
+/// `next_value` lends value scratch, so the reader cannot advance while a selected value is live.
 ///
 /// Call [`Self::finish`] when intentionally stopping early. Normal full traversal performs the
 /// same declared-count and exact-EOF invariant before returning `None`.
@@ -59,9 +58,11 @@ impl<'scratch> ValueRef<'scratch> {
 /// use tansu_sans_io::record::borrowed::{RecordDecodeLimits, ValueRecords};
 ///
 /// fn cannot_advance_while_value_is_live(bytes: Vec<u8>, scratch: &mut [u8]) {
+///     let mut transfer = [0u8; 8 * 1024];
 ///     let mut values = ValueRecords::new(
 ///         Cursor::new(bytes),
 ///         scratch,
+///         &mut transfer,
 ///         1,
 ///         RecordDecodeLimits::default(),
 ///     ).unwrap();
@@ -72,24 +73,31 @@ impl<'scratch> ValueRef<'scratch> {
 /// ```
 #[must_use = "value streams must be exhausted or passed to ValueRecords::finish"]
 #[derive(Debug)]
-pub struct ValueRecords<'scratch, R> {
+pub struct ValueRecords<'value, 'transfer, R> {
     reader: R,
-    scratch: &'scratch mut [u8],
+    scratch: &'value mut [u8],
     declared: i32,
     emitted: usize,
     budget: RecordDecodeBudget,
+    /// Caller-owned transfer storage reused for all skipped fields and terminal EOF validation.
+    transfer: &'transfer mut [u8],
     terminal: bool,
     failure: Option<RecordDecodeError>,
 }
 
-impl<'scratch, R> ValueRecords<'scratch, R>
+impl<'value, 'transfer, R> ValueRecords<'value, 'transfer, R>
 where
     R: Read,
 {
     /// Construct a streaming projection from an already-decompressed record stream.
+    ///
+    /// `scratch` must hold the configured maximum selected value. `transfer` must be nonempty and
+    /// is reused for every discarded key/header and the final EOF probe; its size changes only I/O
+    /// call amortization, so embedders can account and tune the complete fixed memory footprint.
     pub fn new(
         reader: R,
-        scratch: &'scratch mut [u8],
+        scratch: &'value mut [u8],
+        transfer: &'transfer mut [u8],
         declared_count: i32,
         limits: RecordDecodeLimits,
     ) -> Result<Self, RecordDecodeError> {
@@ -106,6 +114,9 @@ where
                 actual: scratch.len(),
             });
         }
+        if transfer.is_empty() {
+            return Err(RecordDecodeError::TransferScratchEmpty);
+        }
 
         Ok(Self {
             reader,
@@ -113,6 +124,7 @@ where
             declared: declared_count,
             emitted: 0,
             budget: RecordDecodeBudget::new(limits),
+            transfer,
             terminal: false,
             failure: None,
         })
@@ -165,8 +177,13 @@ where
         }
 
         let value_length = {
-            let mut body =
-                StreamingBody::new(&mut self.reader, &mut self.budget, self.scratch, length);
+            let mut body = StreamingBody::new(
+                &mut self.reader,
+                &mut self.budget,
+                self.scratch,
+                self.transfer,
+                length,
+            );
             match parse_record_fields(&mut body) {
                 Ok(parsed) => parsed.value,
                 Err(error) => {
@@ -271,7 +288,7 @@ where
         if self.terminal {
             return Ok(());
         }
-        let trailing = match drain_to_end(&mut self.reader, &mut self.budget) {
+        let trailing = match drain_to_end(&mut self.reader, &mut self.budget, self.transfer) {
             Ok(trailing) => trailing,
             Err(error) => {
                 self.failure = Some(error.clone());
@@ -292,6 +309,7 @@ struct StreamingBody<'reader, R> {
     reader: &'reader mut R,
     budget: &'reader mut RecordDecodeBudget,
     scratch: &'reader mut [u8],
+    transfer: &'reader mut [u8],
     declared: usize,
     remaining: usize,
 }
@@ -304,12 +322,14 @@ where
         reader: &'reader mut R,
         budget: &'reader mut RecordDecodeBudget,
         scratch: &'reader mut [u8],
+        transfer: &'reader mut [u8],
         declared: usize,
     ) -> Self {
         Self {
             reader,
             budget,
             scratch,
+            transfer,
             declared,
             remaining: declared,
         }
@@ -376,10 +396,24 @@ where
         if length > self.remaining {
             return Err(RecordDecodeError::Truncated(field));
         }
-        let mut chunk = [0u8; STREAM_CHUNK_BYTES];
+        if length == 0 {
+            return read_exact_from(
+                self.reader,
+                self.budget,
+                &mut self.remaining,
+                &mut [],
+                field,
+            );
+        }
         while length > 0 {
-            let read = length.min(chunk.len());
-            self.read_exact(&mut chunk[..read], field)?;
+            let read = length.min(self.transfer.len());
+            read_exact_from(
+                self.reader,
+                self.budget,
+                &mut self.remaining,
+                &mut self.transfer[..read],
+                field,
+            )?;
             length -= read;
         }
         Ok(())
@@ -465,6 +499,9 @@ fn read_exact_from(
     if output.len() > *remaining {
         return Err(RecordDecodeError::Truncated(field));
     }
+    if output.is_empty() {
+        return budget.charge_work(1);
+    }
     let mut written = 0usize;
     while written < output.len() {
         budget.charge_work(1)?;
@@ -490,8 +527,8 @@ fn read_exact_from(
 fn drain_to_end(
     reader: &mut impl Read,
     budget: &mut RecordDecodeBudget,
+    transfer: &mut [u8],
 ) -> Result<usize, RecordDecodeError> {
-    let mut chunk = [0u8; STREAM_CHUNK_BYTES];
     let mut total = 0usize;
     loop {
         budget.charge_work(1)?;
@@ -499,8 +536,8 @@ fn drain_to_end(
             .remaining_decoded()
             .saturating_add(1)
             .max(1)
-            .min(chunk.len());
-        match reader.read(&mut chunk[..read_capacity]) {
+            .min(transfer.len());
+        match reader.read(&mut transfer[..read_capacity]) {
             Ok(0) => return Ok(total),
             Ok(read) => {
                 budget.charge_decoded(read)?;
