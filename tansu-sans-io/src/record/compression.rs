@@ -16,10 +16,12 @@
 //!
 //! Each codec accepts only its own limit type. There is deliberately no aggregate policy or
 //! `Default`: an embedder must choose memory ceilings that match its admission reservation and
-//! compatibility requirements. Existing owned record inflation remains unchanged.
+//! compatibility requirements. Tansu's owned record conversion selects these same readers through
+//! an internal compatibility policy rather than a second codec implementation.
 
 use std::{
-    fmt, io,
+    fmt,
+    io::{self, Read},
     num::{NonZeroU64, NonZeroUsize},
 };
 
@@ -32,8 +34,98 @@ mod zstd;
 
 pub use gzip::GzipDecoder;
 pub use lz4::Lz4Decoder;
-pub use snappy::XerialSnappyDecoder;
+pub use snappy::{XerialSnappyDecoder, XerialSnappyPreflight};
 pub use zstd::ZstdDecoder;
+
+/// Stack-dispatched reader for Kafka's four compressed record-data encodings.
+///
+/// This enum deliberately has no uncompressed variant. Callers must branch on the batch
+/// compression bits and pass uncompressed record data directly to the record parser, making it
+/// structurally impossible for this adapter to obscure whether decompression limits apply. The
+/// concrete variants avoid a boxed reader and preserve each codec's explicit construction policy.
+pub enum CompressedRecordDataDecoder<'data, 'scratch> {
+    /// One exact RFC 1952 stream, including any concatenated members.
+    Gzip(GzipDecoder<'data>),
+    /// Kafka's Xerial framing over raw Snappy blocks and caller-owned block scratch.
+    XerialSnappy(XerialSnappyDecoder<'data, 'scratch>),
+    /// Exactly one structurally preflighted LZ4 frame.
+    Lz4(Lz4Decoder<'data>),
+    /// Exactly one non-dictionary Zstandard frame.
+    Zstd(ZstdDecoder<'data>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct OwnedRecordCompressionLimits {
+    snappy_block: SnappyBlockLimit,
+    lz4_block: Lz4BlockLimit,
+    zstd_window: ZstdWindowLimit,
+}
+
+impl OwnedRecordCompressionLimits {
+    // Owned conversion is a compatibility API without an admission reservation. It therefore
+    // admits every codec state supported by these backends; bounded embedders select tighter
+    // concrete limits and must not interpret this policy as an aggregate allocation ceiling.
+    pub(crate) const KAFKA_COMPATIBLE: Self = Self {
+        snappy_block: SnappyBlockLimit(NonZeroUsize::MAX),
+        lz4_block: Lz4BlockLimit::MiB4,
+        zstd_window: ZstdWindowLimit(
+            NonZeroU64::new(ZSTD_BACKEND_MAX_WINDOW_BYTES)
+                .expect("the backend maximum is a nonzero power of two"),
+        ),
+    };
+
+    pub(crate) const fn snappy_block(self) -> SnappyBlockLimit {
+        self.snappy_block
+    }
+
+    pub(crate) const fn lz4_block(self) -> Lz4BlockLimit {
+        self.lz4_block
+    }
+
+    pub(crate) const fn zstd_window(self) -> ZstdWindowLimit {
+        self.zstd_window
+    }
+}
+
+impl<'data, 'scratch> CompressedRecordDataDecoder<'data, 'scratch> {
+    /// Construct the gzip variant after allocation-free envelope validation.
+    pub fn gzip(encoded: &'data [u8]) -> Result<Self, CompressionDecodeError> {
+        GzipDecoder::new(encoded).map(Self::Gzip)
+    }
+
+    /// Construct the Xerial Snappy variant after validating all blocks and caller scratch.
+    pub fn xerial_snappy(
+        encoded: &'data [u8],
+        scratch: &'scratch mut [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        XerialSnappyDecoder::new(encoded, scratch, limit).map(Self::XerialSnappy)
+    }
+
+    /// Construct the LZ4 variant after exact structural and block-state preflight.
+    pub fn lz4(encoded: &'data [u8], limit: Lz4BlockLimit) -> Result<Self, CompressionDecodeError> {
+        Lz4Decoder::new(encoded, limit).map(Self::Lz4)
+    }
+
+    /// Construct the Zstandard variant after exact-frame and exact-window preflight.
+    pub fn zstd(
+        encoded: &'data [u8],
+        limit: ZstdWindowLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        ZstdDecoder::new(encoded, limit).map(Self::Zstd)
+    }
+}
+
+impl Read for CompressedRecordDataDecoder<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Gzip(decoder) => decoder.read(output),
+            Self::XerialSnappy(decoder) => decoder.read(output),
+            Self::Lz4(decoder) => decoder.read(output),
+            Self::Zstd(decoder) => decoder.read(output),
+        }
+    }
+}
 
 /// Zstandard's backend minimum window-log parameter; exact preflight may enforce a smaller
 /// single-segment byte ceiling, but the native decoder still retains at least this state class.

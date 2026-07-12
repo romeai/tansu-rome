@@ -53,17 +53,34 @@ impl<'data, 'scratch> XerialSnappyDecoder<'data, 'scratch> {
         scratch: &'scratch mut [u8],
         limit: SnappyBlockLimit,
     ) -> Result<Self, CompressionDecodeError> {
+        Self::preflight(encoded, limit)?.decoder(scratch)
+    }
+
+    /// Validate every Xerial block and determine the scratch required by this stream.
+    pub fn preflight(
+        encoded: &'data [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<XerialSnappyPreflight<'data>, CompressionDecodeError> {
         validate_header(encoded)?;
-        if scratch.len() < limit.bytes() {
+        scan_blocks(encoded, limit).map(|required_scratch_bytes| XerialSnappyPreflight {
+            encoded,
+            required_scratch_bytes,
+        })
+    }
+
+    fn from_preflight(
+        preflight: XerialSnappyPreflight<'data>,
+        scratch: &'scratch mut [u8],
+    ) -> Result<Self, CompressionDecodeError> {
+        if scratch.len() < preflight.required_scratch_bytes {
             return Err(CompressionDecodeError::ScratchTooSmall {
                 kind: CompressionDecodeLimit::SnappyBlockBytes,
-                required: limit.bytes(),
+                required: preflight.required_scratch_bytes,
                 actual: scratch.len(),
             });
         }
-        scan_blocks(encoded, limit)?;
         Ok(Self {
-            encoded,
+            encoded: preflight.encoded,
             scratch,
             encoded_cursor: XERIAL_HEADER_BYTES,
             block_cursor: 0,
@@ -107,6 +124,32 @@ impl<'data, 'scratch> XerialSnappyDecoder<'data, 'scratch> {
             }
             Ok(_) | Err(_) => Err(self.fail()),
         }
+    }
+}
+
+/// Allocation-free proof that every Xerial block fits an explicit decoded-block ceiling.
+///
+/// The proof borrows the exact encoded stream it describes, preventing construction with bytes
+/// that were not scanned. This split lets owned consumers allocate only the largest block present,
+/// while admission-aware consumers can lend scratch reserved for their configured ceiling.
+#[derive(Debug)]
+pub struct XerialSnappyPreflight<'data> {
+    encoded: &'data [u8],
+    required_scratch_bytes: usize,
+}
+
+impl<'data> XerialSnappyPreflight<'data> {
+    /// Largest decoded block in the validated stream.
+    pub fn required_scratch_bytes(&self) -> usize {
+        self.required_scratch_bytes
+    }
+
+    /// Construct a decoder by lending scratch for the largest validated block.
+    pub fn decoder<'scratch>(
+        self,
+        scratch: &'scratch mut [u8],
+    ) -> Result<XerialSnappyDecoder<'data, 'scratch>, CompressionDecodeError> {
+        XerialSnappyDecoder::from_preflight(self, scratch)
     }
 }
 
@@ -164,12 +207,13 @@ fn validate_header(encoded: &[u8]) -> Result<(), CompressionDecodeError> {
     Ok(())
 }
 
-fn scan_blocks(encoded: &[u8], limit: SnappyBlockLimit) -> Result<(), CompressionDecodeError> {
+fn scan_blocks(encoded: &[u8], limit: SnappyBlockLimit) -> Result<usize, CompressionDecodeError> {
     let invalid = |reason| CompressionDecodeError::InvalidData {
         codec: Compression::Snappy,
         reason,
     };
     let mut cursor = XERIAL_HEADER_BYTES;
+    let mut required_scratch_bytes = 0;
     while cursor < encoded.len() {
         let length_end = cursor
             .checked_add(BLOCK_LENGTH_BYTES)
@@ -195,7 +239,8 @@ fn scan_blocks(encoded: &[u8], limit: SnappyBlockLimit) -> Result<(), Compressio
                 actual: decoded as u64,
             });
         }
+        required_scratch_bytes = required_scratch_bytes.max(decoded);
         cursor = block_end;
     }
-    Ok(())
+    Ok(required_scratch_bytes)
 }

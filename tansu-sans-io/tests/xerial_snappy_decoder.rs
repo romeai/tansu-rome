@@ -94,6 +94,13 @@ fn scans_later_blocks_and_scratch_before_decompression() -> Result<(), Box<dyn s
             actual: 7,
         })
     ));
+
+    let encoded = xerial(&[b"tiny"]);
+    let preflight = XerialSnappyDecoder::preflight(&encoded, SnappyBlockLimit::new(64)?)?;
+    assert_eq!(4, preflight.required_scratch_bytes());
+    let mut exact_scratch = [0u8; 4];
+    let mut decoder = preflight.decoder(&mut exact_scratch)?;
+    assert_eq!(b"tiny", read_all(&mut decoder)?.as_slice());
     Ok(())
 }
 

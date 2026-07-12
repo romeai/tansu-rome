@@ -13,7 +13,11 @@
 // limitations under the License.
 //
 //! Deflated (compressed) Kafka Records
-use std::{fmt::Formatter, io::Write, result};
+use std::{
+    fmt::Formatter,
+    io::{Read, Write},
+    result,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flate2::write::GzEncoder;
@@ -23,7 +27,15 @@ use serde::{
 };
 use tracing::{debug, error, instrument};
 
-use crate::{ByteSize, Compression, Decode as _, Decoder, Encode, Error, Result, record::Record};
+use crate::{
+    ByteSize, Compression, Decoder, Encode, Error, Result,
+    record::{
+        Record,
+        compression::{
+            CompressedRecordDataDecoder, OwnedRecordCompressionLimits, XerialSnappyDecoder,
+        },
+    },
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Frame {
@@ -357,6 +369,24 @@ fn into_record_data(records: &[Record], compression: Compression) -> Result<Byte
                 .map_err(Into::into)
         }
 
+        Compression::Snappy => {
+            // Kafka's Snappy encoding uses the Xerial envelope so a consumer can bound and reuse
+            // one raw block at a time; emitting one unframed raw stream would lose those boundaries.
+            const BLOCK_BYTES: usize = 32 * 1024;
+            let uncompressed = records.encode()?;
+            let mut encoded = BytesMut::with_capacity(uncompressed.len());
+            encoded.put_slice(b"\x82SNAPPY\0");
+            encoded.put_i32(1);
+            encoded.put_i32(1);
+            let mut encoder = snap::raw::Encoder::new();
+            for block in uncompressed.chunks(BLOCK_BYTES) {
+                let compressed = encoder.compress_vec(block)?;
+                encoded.put_u32(u32::try_from(compressed.len())?);
+                encoded.put_slice(&compressed);
+            }
+            Ok(encoded.freeze())
+        }
+
         Compression::Lz4 => {
             let uncompressed = records.encode()?;
 
@@ -384,8 +414,6 @@ fn into_record_data(records: &[Record], compression: Compression) -> Result<Byte
                 .map(Bytes::from)
                 .map_err(Into::into)
         }
-
-        unexpected => Err(Error::UnexpectedType(format!("{unexpected:?}",))),
     }
 }
 
@@ -422,39 +450,8 @@ impl TryFrom<Batch> for Vec<Record> {
     type Error = Error;
 
     #[instrument(skip_all)]
-    fn try_from(mut batch: Batch) -> Result<Self, Self::Error> {
-        let record_count = usize::try_from(batch.record_count)?;
-
-        debug!(?record_count);
-        debug!(?batch.record_data);
-
-        if batch
-            .compression()
-            .is_ok_and(|compression| compression == Compression::None)
-        {
-            let mut records = Vec::with_capacity(record_count);
-
-            for _ in 0..record_count {
-                let record = Record::decode(&mut batch.record_data)?;
-                records.push(record);
-            }
-
-            Ok(records)
-        } else {
-            let mut reader = batch
-                .compression()
-                .and_then(|compression| compression.inflator(batch.record_data.reader()))?;
-
-            let mut decoder = Decoder::new(&mut reader);
-            let mut records = Vec::with_capacity(record_count);
-
-            for _ in 0..record_count {
-                let record = Record::deserialize(&mut decoder)?;
-                records.push(record);
-            }
-
-            Ok(records)
-        }
+    fn try_from(batch: Batch) -> Result<Self, Self::Error> {
+        decode_records(&batch, OwnedRecordCompressionLimits::KAFKA_COMPATIBLE)
     }
 }
 
@@ -462,25 +459,59 @@ impl TryFrom<&Batch> for Vec<Record> {
     type Error = Error;
 
     fn try_from(batch: &Batch) -> Result<Self, Self::Error> {
-        let record_count = usize::try_from(batch.record_count)?;
-
-        debug!(?record_count);
-        debug!(?batch.record_data);
-
-        let mut reader = batch
-            .compression()
-            .and_then(|compression| compression.inflator(batch.record_data.clone().reader()))?;
-
-        let mut decoder = Decoder::new(&mut reader);
-        let mut records = Vec::with_capacity(record_count);
-
-        for _ in 0..record_count {
-            let record = Record::deserialize(&mut decoder)?;
-            records.push(record);
-        }
-
-        Ok(records)
+        decode_records(batch, OwnedRecordCompressionLimits::KAFKA_COMPATIBLE)
     }
+}
+
+fn decode_records(batch: &Batch, limits: OwnedRecordCompressionLimits) -> Result<Vec<Record>> {
+    let record_count = usize::try_from(batch.record_count)?;
+
+    debug!(?record_count);
+    debug!(record_data = ?batch.record_data);
+
+    match batch.compression()? {
+        Compression::None => decode_exact_records(batch.record_data.as_ref(), record_count),
+        Compression::Gzip => decode_exact_records(
+            CompressedRecordDataDecoder::gzip(batch.record_data.as_ref())?,
+            record_count,
+        ),
+        Compression::Snappy => {
+            // Xerial streams expose every decoded block length in their envelope. The owned path
+            // allocates only the largest validated block, while the explicit limit preserves the
+            // caller's authority over peer-selected scratch state.
+            let preflight =
+                XerialSnappyDecoder::preflight(batch.record_data.as_ref(), limits.snappy_block())?;
+            let mut scratch = vec![0; preflight.required_scratch_bytes()];
+            decode_exact_records(preflight.decoder(&mut scratch)?, record_count)
+        }
+        Compression::Lz4 => decode_exact_records(
+            CompressedRecordDataDecoder::lz4(batch.record_data.as_ref(), limits.lz4_block())?,
+            record_count,
+        ),
+        Compression::Zstd => decode_exact_records(
+            CompressedRecordDataDecoder::zstd(batch.record_data.as_ref(), limits.zstd_window())?,
+            record_count,
+        ),
+    }
+}
+
+fn decode_exact_records(mut reader: impl Read, record_count: usize) -> Result<Vec<Record>> {
+    let mut decoder = Decoder::new(&mut reader);
+    let mut records = Vec::with_capacity(record_count);
+
+    for _ in 0..record_count {
+        records.push(Record::deserialize(&mut decoder)?);
+    }
+
+    // Reading through exact EOF validates terminal codec state such as gzip trailers and prevents
+    // a forged record count from making a decoded prefix indistinguishable from a complete batch.
+    drop(decoder);
+    let mut trailing = [0];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(Error::RecordDataNotExhausted);
+    }
+
+    Ok(records)
 }
 
 const FIXED_BATCH_LENGTH: usize =

@@ -127,7 +127,6 @@ pub mod ser;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
-use flate2::read::GzDecoder;
 use primitive::tagged::TagBuffer;
 use record::deflated::Frame as RecordBatch;
 pub use ser::Encoder;
@@ -137,7 +136,7 @@ use std::{
     collections::HashMap,
     env::VarError,
     fmt::{self, Display, Formatter},
-    io::{self, BufRead, Cursor, Read},
+    io::{self, Cursor},
     num,
     process::{ExitCode, Termination},
     str::{self, FromStr},
@@ -146,7 +145,7 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 use tansu_model::{MessageKind, MessageMeta};
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, instrument, warn};
 use tracing_subscriber::filter::ParseError;
 
 /// The null topic identifier.
@@ -427,6 +426,7 @@ pub enum Error {
     InvalidIsolationLevel(i8),
     InvalidOpType(i8),
     InvalidScramMechanism(i8),
+    CompressionDecode(#[from] record::compression::CompressionDecodeError),
     Io(Arc<io::Error>),
     DecodeLimitExceeded {
         kind: DecodeLimit,
@@ -449,6 +449,7 @@ pub enum Error {
     ParseFilter(Arc<ParseError>),
     ParseScram(String),
     Poison,
+    RecordDataNotExhausted,
     ResponseFrame,
     Snap(#[from] snap::Error),
     StringWithoutApiVersion,
@@ -1850,63 +1851,6 @@ impl From<Compression> for i16 {
             Compression::Snappy => 2,
             Compression::Lz4 => 3,
             Compression::Zstd => 4,
-        }
-    }
-}
-
-impl Compression {
-    fn inflator(&self, mut deflated: impl BufRead + 'static) -> Result<Box<dyn Read>> {
-        match self {
-            Compression::None => Ok(Box::new(deflated)),
-            Compression::Gzip => Ok(Box::new(GzDecoder::new(deflated))),
-            Compression::Snappy => {
-                let mut input = vec![];
-                _ = deflated.read_to_end(&mut input)?;
-                debug!(?input);
-
-                let mut decoder = snap::raw::Decoder::new();
-
-                decoder
-                    .decompress_vec(
-                        // https://github.com/xerial/snappy-java/tree/master?tab=readme-ov-file#compatibility-notes
-                        if input.starts_with(b"\x82SNAPPY\0") {
-                            if let (b"\x82SNAPPY\0", remainder) = input.split_at(8) {
-                                let (version, remainder) = remainder.split_at(4);
-                                let version: i32 = version.try_into().map(i32::from_be_bytes)?;
-
-                                let (compatible_version, remainder) = remainder.split_at(4);
-                                let compatible_version: i32 =
-                                    compatible_version.try_into().map(i32::from_be_bytes)?;
-
-                                let (block_size, _) = remainder.split_at(4);
-                                let block_size: i32 =
-                                    block_size.try_into().map(i32::from_be_bytes)?;
-
-                                debug!(version, compatible_version, block_size);
-                            }
-
-                            let skip_header = &input[20..];
-                            debug!(?skip_header);
-                            skip_header
-                        } else {
-                            &input[..]
-                        },
-                    )
-                    .map_err(Into::into)
-                    .map(Bytes::from)
-                    .map(|bytes| bytes.reader())
-                    .map(Box::new)
-                    .map(|boxed| boxed as Box<dyn Read>)
-                    .inspect_err(|err| error!(?err))
-            }
-            Compression::Lz4 => lz4::Decoder::new(deflated)
-                .map(Box::new)
-                .map(|boxed| boxed as Box<dyn Read>)
-                .map_err(Into::into),
-            Compression::Zstd => zstd::stream::read::Decoder::with_buffer(deflated)
-                .map(Box::new)
-                .map(|boxed| boxed as Box<dyn Read>)
-                .map_err(Into::into),
         }
     }
 }
