@@ -18,7 +18,7 @@ use crate::{
     CancelKind, DEFAULT_MAXIMUM_FRAME_SIZE, Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
     otel,
-    service::services_with_maximum_frame_size,
+    service::{connection_service, routes},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -288,6 +288,11 @@ where
 
         let mut connections = 0;
 
+        // Route entries contain immutable process-wide protocol composition.
+        // SASL transcripts and framing mode are constructed per accepted
+        // socket so one peer's identity can never authorize another peer.
+        let routes = routes(self.groups.clone(), self.storage.clone())?;
+
         loop {
             connections += 1;
 
@@ -316,13 +321,12 @@ where
 
                     stream.set_nodelay(true)?;
 
-                    let service = services_with_maximum_frame_size(
+                    let service = connection_service(
                         self.cluster_id.as_str(),
-                        self.groups.clone(),
-                        self.storage.clone(),
+                        routes.clone(),
                         self.sasl_config.clone(),
                         self.maximum_frame_size,
-                    )?;
+                    );
 
                     let handle = set.spawn(async move {
                             match service.serve(c, stream).await {
