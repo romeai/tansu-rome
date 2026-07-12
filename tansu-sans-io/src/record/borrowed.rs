@@ -177,6 +177,9 @@ pub enum RecordSetError {
     /// The number of structurally validated batches overflowed this address space.
     #[error("record set batch count overflows this address space")]
     BatchCountOverflow,
+    /// Cumulative record-set validation work overflowed this address space.
+    #[error("record set validation work overflows this address space")]
+    WorkUnitOverflow,
     /// The CRC-32C covering batch attributes through record data did not match.
     #[error(
         "record batch at offset {offset} has CRC mismatch: declared {declared:#010x}, computed {computed:#010x}"
