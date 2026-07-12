@@ -65,7 +65,18 @@ fn every_variant_is_a_generic_exact_read_stream() -> Result<(), Box<dyn std::err
     let mut snappy_scratch = [0; 64];
     assert_eq!(
         DECODED,
-        read_in_small_chunks(CompressedRecordDataDecoder::xerial_snappy(
+        read_in_small_chunks(CompressedRecordDataDecoder::snappy(
+            &snappy,
+            &mut snappy_scratch,
+            SnappyBlockLimit::new(64)?,
+        )?)?
+    );
+
+    let snappy = snap::raw::Encoder::new().compress_vec(DECODED)?;
+    let mut snappy_scratch = [0; 64];
+    assert_eq!(
+        DECODED,
+        read_in_small_chunks(CompressedRecordDataDecoder::snappy(
             &snappy,
             &mut snappy_scratch,
             SnappyBlockLimit::new(64)?,

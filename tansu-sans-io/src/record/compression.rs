@@ -34,7 +34,7 @@ mod zstd;
 
 pub use gzip::GzipDecoder;
 pub use lz4::Lz4Decoder;
-pub use snappy::{XerialSnappyDecoder, XerialSnappyPreflight};
+pub use snappy::{SnappyDecoder, SnappyPreflight, XerialSnappyDecoder, XerialSnappyPreflight};
 pub use zstd::ZstdDecoder;
 
 /// Stack-dispatched reader for Kafka's four compressed record-data encodings.
@@ -46,8 +46,8 @@ pub use zstd::ZstdDecoder;
 pub enum CompressedRecordDataDecoder<'data, 'scratch> {
     /// One exact RFC 1952 stream, including any concatenated members.
     Gzip(GzipDecoder<'data>),
-    /// Kafka's Xerial framing over raw Snappy blocks and caller-owned block scratch.
-    XerialSnappy(XerialSnappyDecoder<'data, 'scratch>),
+    /// Kafka-compatible Xerial or raw Snappy using caller-owned scratch.
+    Snappy(SnappyDecoder<'data, 'scratch>),
     /// Exactly one structurally preflighted LZ4 frame.
     Lz4(Lz4Decoder<'data>),
     /// Exactly one non-dictionary Zstandard frame.
@@ -99,7 +99,18 @@ impl<'data, 'scratch> CompressedRecordDataDecoder<'data, 'scratch> {
         scratch: &'scratch mut [u8],
         limit: SnappyBlockLimit,
     ) -> Result<Self, CompressionDecodeError> {
-        XerialSnappyDecoder::new(encoded, scratch, limit).map(Self::XerialSnappy)
+        XerialSnappyDecoder::new(encoded, scratch, limit)
+            .map(SnappyDecoder::Xerial)
+            .map(Self::Snappy)
+    }
+
+    /// Construct a Kafka-compatible Snappy reader after classifying Xerial or raw framing.
+    pub fn snappy(
+        encoded: &'data [u8],
+        scratch: &'scratch mut [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        SnappyDecoder::new(encoded, scratch, limit).map(Self::Snappy)
     }
 
     /// Construct the LZ4 variant after exact structural and block-state preflight.
@@ -120,7 +131,7 @@ impl Read for CompressedRecordDataDecoder<'_, '_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Gzip(decoder) => decoder.read(output),
-            Self::XerialSnappy(decoder) => decoder.read(output),
+            Self::Snappy(decoder) => decoder.read(output),
             Self::Lz4(decoder) => decoder.read(output),
             Self::Zstd(decoder) => decoder.read(output),
         }

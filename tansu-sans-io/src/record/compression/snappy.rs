@@ -29,6 +29,160 @@ const XERIAL_MINIMUM_COMPATIBLE_VERSION: i32 = 1;
 /// Bytes in each big-endian Xerial compressed-block length.
 const BLOCK_LENGTH_BYTES: usize = 4;
 
+/// Kafka-compatible Snappy reader accepting both the Xerial block envelope
+/// and the raw stream emitted by established librdkafka clients.
+#[derive(Debug)]
+pub enum SnappyDecoder<'data, 'scratch> {
+    Xerial(XerialSnappyDecoder<'data, 'scratch>),
+    Raw(RawSnappyDecoder<'data, 'scratch>),
+}
+
+impl<'data, 'scratch> SnappyDecoder<'data, 'scratch> {
+    /// Classify and validate the complete stream before retaining scratch.
+    pub fn new(
+        encoded: &'data [u8],
+        scratch: &'scratch mut [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<Self, CompressionDecodeError> {
+        Self::preflight(encoded, limit)?.decoder(scratch)
+    }
+
+    /// Determine the exact caller scratch required by either compatible framing.
+    pub fn preflight(
+        encoded: &'data [u8],
+        limit: SnappyBlockLimit,
+    ) -> Result<SnappyPreflight<'data>, CompressionDecodeError> {
+        if encoded.starts_with(XERIAL_MAGIC) {
+            XerialSnappyDecoder::preflight(encoded, limit).map(SnappyPreflight::Xerial)
+        } else {
+            raw_decoded_length(encoded, limit)
+                .map(|decoded| SnappyPreflight::Raw { encoded, decoded })
+        }
+    }
+}
+
+impl Read for SnappyDecoder<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Xerial(decoder) => decoder.read(output),
+            Self::Raw(decoder) => decoder.read(output),
+        }
+    }
+}
+
+/// Allocation-free proof of the scratch required by one compatible Snappy stream.
+#[derive(Debug)]
+pub enum SnappyPreflight<'data> {
+    Xerial(XerialSnappyPreflight<'data>),
+    Raw {
+        encoded: &'data [u8],
+        decoded: usize,
+    },
+}
+
+impl<'data> SnappyPreflight<'data> {
+    pub fn required_scratch_bytes(&self) -> usize {
+        match self {
+            Self::Xerial(preflight) => preflight.required_scratch_bytes(),
+            Self::Raw { decoded, .. } => *decoded,
+        }
+    }
+
+    pub fn decoder<'scratch>(
+        self,
+        scratch: &'scratch mut [u8],
+    ) -> Result<SnappyDecoder<'data, 'scratch>, CompressionDecodeError> {
+        match self {
+            Self::Xerial(preflight) => preflight.decoder(scratch).map(SnappyDecoder::Xerial),
+            Self::Raw { encoded, decoded } => {
+                RawSnappyDecoder::new(encoded, decoded, scratch).map(SnappyDecoder::Raw)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RawSnappyDecoder<'data, 'scratch> {
+    encoded: &'data [u8],
+    scratch: &'scratch mut [u8],
+    cursor: usize,
+    decoded: usize,
+    loaded: bool,
+    failed: bool,
+}
+
+impl<'data, 'scratch> RawSnappyDecoder<'data, 'scratch> {
+    fn new(
+        encoded: &'data [u8],
+        decoded: usize,
+        scratch: &'scratch mut [u8],
+    ) -> Result<Self, CompressionDecodeError> {
+        if scratch.len() < decoded {
+            return Err(CompressionDecodeError::ScratchTooSmall {
+                kind: CompressionDecodeLimit::SnappyBlockBytes,
+                required: decoded,
+                actual: scratch.len(),
+            });
+        }
+        Ok(Self {
+            encoded,
+            scratch,
+            cursor: 0,
+            decoded,
+            loaded: false,
+            failed: false,
+        })
+    }
+}
+
+impl Read for RawSnappyDecoder<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.failed {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        if !self.loaded {
+            match snap::raw::Decoder::new()
+                .decompress(self.encoded, &mut self.scratch[..self.decoded])
+            {
+                Ok(actual) if actual == self.decoded => self.loaded = true,
+                Ok(_) | Err(_) => {
+                    self.failed = true;
+                    return Err(io::Error::from(io::ErrorKind::InvalidData));
+                }
+            }
+        }
+        if self.cursor == self.decoded {
+            return Ok(0);
+        }
+        let copied = (self.decoded - self.cursor).min(output.len());
+        output[..copied].copy_from_slice(&self.scratch[self.cursor..self.cursor + copied]);
+        self.cursor += copied;
+        Ok(copied)
+    }
+}
+
+fn raw_decoded_length(
+    encoded: &[u8],
+    limit: SnappyBlockLimit,
+) -> Result<usize, CompressionDecodeError> {
+    let decoded =
+        snap::raw::decompress_len(encoded).map_err(|_| CompressionDecodeError::InvalidData {
+            codec: Compression::Snappy,
+            reason: "raw Snappy header is invalid",
+        })?;
+    if decoded > limit.bytes() {
+        return Err(CompressionDecodeError::LimitExceeded {
+            kind: CompressionDecodeLimit::SnappyBlockBytes,
+            limit: limit.bytes() as u64,
+            actual: decoded as u64,
+        });
+    }
+    Ok(decoded)
+}
+
 /// Streaming Kafka Xerial Snappy decoder using caller-owned block scratch.
 ///
 /// Construction scans every compressed block and asks Snappy for its decoded length before any

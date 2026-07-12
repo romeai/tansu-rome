@@ -31,9 +31,7 @@ use crate::{
     ByteSize, Compression, Decoder, Encode, Error, Result,
     record::{
         Record,
-        compression::{
-            CompressedRecordDataDecoder, OwnedRecordCompressionLimits, XerialSnappyDecoder,
-        },
+        compression::{CompressedRecordDataDecoder, OwnedRecordCompressionLimits, SnappyDecoder},
     },
 };
 
@@ -480,7 +478,7 @@ fn decode_records(batch: &Batch, limits: OwnedRecordCompressionLimits) -> Result
             // allocates only the largest validated block, while the explicit limit preserves the
             // caller's authority over peer-selected scratch state.
             let preflight =
-                XerialSnappyDecoder::preflight(batch.record_data.as_ref(), limits.snappy_block())?;
+                SnappyDecoder::preflight(batch.record_data.as_ref(), limits.snappy_block())?;
             let mut scratch = vec![0; preflight.required_scratch_bytes()];
             decode_exact_records(preflight.decoder(&mut scratch)?, record_count)
         }
