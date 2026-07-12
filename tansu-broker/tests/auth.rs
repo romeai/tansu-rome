@@ -14,6 +14,8 @@
 
 use std::{
     collections::BTreeMap,
+    io::ErrorKind,
+    mem::size_of,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -51,6 +53,8 @@ use tansu_storage::{
     Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
     UpdateError, Version,
 };
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, instrument};
 use url::Url;
 use uuid::Uuid;
@@ -889,31 +893,53 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
         },
     );
 
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
+    let sasl_config = tansu_auth::configuration(engine.clone()).map_err(Error::from)?;
+    let routes = storage::services(FrameRouteService::<(), Error>::builder(), engine)
+        .and_then(auth::services)?
+        .into_admitted_with_limits::<()>(tansu_sans_io::DecodeLimits::default())?
+        .build();
+    let service = tansu_broker::service::connection_service(
+        "sasl-v0-test",
+        routes,
+        Some(sasl_config),
+        tansu_broker::DEFAULT_MAXIMUM_FRAME_SIZE,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+    let mut client = client?;
+    let (server, _) = accepted?;
+    let server = tokio::spawn(async move { service.serve(Context::default(), server).await });
 
     const API_VERSION: i16 = 0;
 
-    let ctx = Context::default();
+    async fn exchange(stream: &mut TcpStream, request: Bytes) -> Result<Bytes> {
+        stream.write_all(&request).await?;
+        let mut prefix = [0; size_of::<i32>()];
+        _ = stream.read_exact(&mut prefix).await?;
+        let body_len = usize::try_from(i32::from_be_bytes(prefix))?;
+        let mut response = BytesMut::with_capacity(prefix.len() + body_len);
+        response.extend_from_slice(&prefix);
+        response.resize(prefix.len() + body_len, 0);
+        _ = stream.read_exact(&mut response[prefix.len()..]).await?;
+        Ok(response.freeze())
+    }
 
-    let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
-                Header::Request {
-                    api_key: SaslHandshakeRequest::KEY,
-                    api_version: API_VERSION,
-                    correlation_id: 1,
-                    client_id: Some(CLIENT_ID.into()),
-                },
-                Body::SaslHandshakeRequest(
-                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
-                ),
-            )?,
-        )
-        .await?;
+    let response = exchange(
+        &mut client,
+        Frame::request(
+            Header::Request {
+                api_key: SaslHandshakeRequest::KEY,
+                api_version: API_VERSION,
+                correlation_id: 1,
+                client_id: Some(CLIENT_ID.into()),
+            },
+            Body::SaslHandshakeRequest(
+                SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
+            ),
+        )?,
+    )
+    .await?;
 
     let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
         .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
@@ -957,7 +983,7 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
                     Bytes::from(frame)
                 })?;
 
-                let response = broker.serve(ctx.clone(), frame).await?;
+                let response = exchange(&mut client, frame).await?;
 
                 input = Some(response.slice(4..));
             }
@@ -968,6 +994,13 @@ async fn auth_handshake_scram_256_v0() -> Result<()> {
             }
         }
     }
+
+    drop(client);
+    assert!(matches!(
+        server.await?,
+        Err(tansu_service::RequestAdmissionError::Io(error))
+            if error.kind() == ErrorKind::UnexpectedEof
+    ));
 
     Ok(())
 }

@@ -2308,7 +2308,7 @@ mod tests {
         TcpKeepaliveConfig, TcpListenerService, TcpTransportConfig, TcpTransportConfigError,
         configure_admitted_socket,
     };
-    use crate::{BytesFrameLayer, Error};
+    use crate::{Error, FrameRouteService, RouteSession};
 
     #[derive(Clone, Debug)]
     struct EchoService {
@@ -3306,7 +3306,7 @@ mod tests {
     async fn opaque_sasl_prelude_does_not_read_a_kafka_head() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let drops = Arc::new(AtomicUsize::new(0));
-        let session = crate::RouteSession::anonymous();
+        let session = RouteSession::anonymous();
         session.force_opaque_sasl_v0_for_transport_test();
         let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
         let service = TcpBytesLayer::<()>::default()
@@ -3347,7 +3347,7 @@ mod tests {
     async fn opaque_sasl_token_has_its_own_post_admission_deadline() {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let drops = Arc::new(AtomicUsize::new(0));
-        let session = crate::RouteSession::anonymous();
+        let session = RouteSession::anonymous();
         session.force_opaque_sasl_v0_for_transport_test();
         let (observed_tx, _observed_rx) = mpsc::unbounded_channel();
         let service = TcpBytesLayer::<()>::default()
@@ -3885,6 +3885,20 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (started_tx, _started_rx) = mpsc::unbounded_channel();
         let (handled_tx, mut handled_rx) = mpsc::unbounded_channel();
+        let routes = FrameRouteService::<(), Error>::builder()
+            .with_route(
+                ProduceRequest::KEY,
+                ProduceSequenceService {
+                    calls: calls.clone(),
+                    handled: handled_tx,
+                }
+                .boxed(),
+            )
+            .unwrap()
+            .into_admitted::<RequestLease>()
+            .unwrap()
+            .build()
+            .for_connection(RouteSession::anonymous());
         let service = TcpBytesLayer::<()>::default()
             .with_request_policy(RequestPolicy {
                 gate: Arc::new(Semaphore::new(2)),
@@ -3892,12 +3906,7 @@ mod tests {
                 drops: drops.clone(),
                 abort: false,
             })
-            .into_layer(
-                BytesFrameLayer::default().into_layer(ProduceSequenceService {
-                    calls: calls.clone(),
-                    handled: handled_tx,
-                }),
-            );
+            .into_layer(routes);
         let (mut client, server) = duplex(512);
         let server = tokio::spawn(async move {
             service

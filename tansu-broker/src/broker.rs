@@ -15,10 +15,10 @@
 pub mod group;
 
 use crate::{
-    CancelKind, DEFAULT_MAXIMUM_FRAME_SIZE, Error, Result,
+    CancelKind, DEFAULT_MAXIMUM_FRAME_SIZE, Result,
     coordinator::group::{Coordinator, administrator::Controller},
     otel,
-    service::{connection_service, routes},
+    service::{admitted_routes, compatibility_decode_limits, connection_service},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -291,7 +291,8 @@ where
         // Route entries contain immutable process-wide protocol composition.
         // SASL transcripts and framing mode are constructed per accepted
         // socket so one peer's identity can never authorize another peer.
-        let routes = routes(self.groups.clone(), self.storage.clone())?;
+        let decode_limits = compatibility_decode_limits(self.maximum_frame_size)?;
+        let routes = admitted_routes(self.groups.clone(), self.storage.clone(), decode_limits)?;
 
         loop {
             connections += 1;
@@ -330,7 +331,7 @@ where
 
                     let handle = set.spawn(async move {
                             match service.serve(c, stream).await {
-                                Err(Error::Io(ref io))
+                                Err(tansu_service::RequestAdmissionError::Io(ref io))
                                     if io.kind() == ErrorKind::UnexpectedEof
                                         || io.kind() == ErrorKind::BrokenPipe
                                         || io.kind() == ErrorKind::ConnectionReset => {}
@@ -731,7 +732,10 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 #[cfg(test)]
 mod tests {
     use rama::{Context, Service as _};
-    use tokio::io::{AsyncWriteExt as _, duplex};
+    use tokio::{
+        io::AsyncWriteExt as _,
+        net::{TcpListener, TcpStream},
+    };
 
     use super::*;
 
@@ -758,7 +762,11 @@ mod tests {
             broker.maximum_frame_size,
         )
         .unwrap();
-        let (mut client, server) = duplex(32);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut client = client.unwrap();
+        let (server, _) = accepted.unwrap();
         let declared = DEFAULT_MAXIMUM_FRAME_SIZE + 1;
         client
             .write_all(&i32::try_from(declared).unwrap().to_be_bytes())
@@ -767,7 +775,8 @@ mod tests {
 
         assert!(matches!(
             service.serve(Context::default(), server).await,
-            Err(Error::Service(tansu_service::Error::FrameTooBig {
+            Err(tansu_service::RequestAdmissionError::Frame(
+                tansu_service::Error::FrameTooBig {
                 declared: rejected,
                 maximum: DEFAULT_MAXIMUM_FRAME_SIZE,
             })) if rejected == declared
