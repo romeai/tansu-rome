@@ -14,16 +14,21 @@
 
 //! Lending, allocation-free decoding of uncompressed magic-v2 records.
 //!
-//! One semantic parser accepts an arbitrary record-body slice plus a shared decode budget. The
-//! uncompressed adapter in this module supplies frame-backed slices. A later compressed projection
-//! can reuse the limits and grammar while visiting fields incrementally, without requiring a
-//! whole-record scratch allocation merely to retain one selected value.
+//! One semantic parser owns Kafka's record-field grammar behind a private primitive cursor seam.
+//! The uncompressed adapter supplies frame-backed ranges, while the streaming adapter visits
+//! decompressed fields incrementally. Both therefore share field order, nullability, limits,
+//! headers, and exact-body validation without requiring whole-record scratch merely to retain one
+//! selected value.
 
 use std::{fmt, ops::Range};
 
 use crate::Compression;
 
 use super::Batch;
+
+mod values;
+
+pub use values::{ValueRecords, ValueRef};
 
 /// Maximum bytes in Kafka's zigzag-encoded signed INT32 representation.
 const MAX_VARINT_BYTES: usize = 5;
@@ -73,7 +78,7 @@ impl fmt::Display for RecordDecodeLimit {
     }
 }
 
-/// Resource limits shared by uncompressed and future streaming-compression record adapters.
+/// Resource limits shared by uncompressed and streaming-decompression record adapters.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RecordDecodeLimits {
     /// Maximum bytes declared by one record body.
@@ -94,6 +99,60 @@ pub struct RecordDecodeLimits {
     pub max_headers: usize,
     /// Maximum primitive parse and traversal operations across the batch.
     pub max_work_units: usize,
+}
+
+/// Immutable resource evidence from one record-decoder attempt.
+///
+/// A caller can snapshot this value after a failed `next_record` or `next_value` call and charge
+/// the observed work to a request-wide budget before dropping the failed decoder. Counters are
+/// monotonic, count attempted work even when the operation that charged it fails, and never grant
+/// access to mutate or reset the decoder's internal budget.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordDecodeProgress {
+    /// Bytes actually consumed from the record stream, including length prefixes, bodies, and
+    /// trailing bytes inspected while proving exact exhaustion.
+    pub decoded_bytes: usize,
+    /// Records whose semantic body decode began after a valid nonnegative, bounded record length.
+    /// A record remains begun when a later field, limit, or reader operation rejects its body.
+    pub records_begun: usize,
+    /// Records whose complete body passed validation and whose view or value was returned.
+    pub records_emitted: usize,
+    /// Headers declared by successfully decoded header-count fields, including headers whose later
+    /// key or value validation fails.
+    pub headers_declared: usize,
+    /// Primitive parse, traversal, and reader operations attempted, including the operation that
+    /// first exceeds the configured work limit.
+    pub work_units: usize,
+}
+
+/// Terminal decode failure paired with the monotonic resource evidence observed before failure.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{error}")]
+pub struct RecordDecodeFailure {
+    #[source]
+    error: RecordDecodeError,
+    progress: RecordDecodeProgress,
+}
+
+impl RecordDecodeFailure {
+    fn new(error: RecordDecodeError, progress: RecordDecodeProgress) -> Self {
+        Self { error, progress }
+    }
+
+    /// Typed protocol, limit, or reader failure discovered by terminal validation.
+    pub fn error(&self) -> &RecordDecodeError {
+        &self.error
+    }
+
+    /// Final immutable resource evidence, including the operation that caused failure.
+    pub fn progress(&self) -> RecordDecodeProgress {
+        self.progress
+    }
+
+    /// Consume the failure into independently owned error and progress values.
+    pub fn into_parts(self) -> (RecordDecodeError, RecordDecodeProgress) {
+        (self.error, self.progress)
+    }
 }
 
 impl RecordDecodeLimits {
@@ -163,6 +222,17 @@ pub enum RecordDecodeError {
     /// A cumulative counter could not represent another observed unit.
     #[error("record decode {resource} counter overflow")]
     CounterOverflow { resource: &'static str },
+    /// Caller-owned fixed scratch cannot retain the configured maximum selected value.
+    #[error("value scratch has {actual} bytes but record limits require {required}")]
+    ScratchTooSmall { required: usize, actual: usize },
+    /// The caller-supplied decompressed reader failed.
+    #[error("record reader failed while decoding {field} with {kind:?}")]
+    ReaderIo {
+        /// Record field or exhaustion check whose read failed.
+        field: &'static str,
+        /// Stable standard-library classification of the underlying reader failure.
+        kind: std::io::ErrorKind,
+    },
     /// The stream ended or the caller finished before the signed declared count was observed.
     #[error("record count mismatch: batch declared {declared}, decoded {actual}")]
     RecordCountMismatch { declared: i32, actual: usize },
@@ -206,6 +276,25 @@ impl RecordDecodeBudget {
     /// Limits owned by this monotonic budget, shared unchanged with codec adapters.
     pub(crate) fn limits(&self) -> RecordDecodeLimits {
         self.limits
+    }
+
+    /// Bytes still allowed before a one-byte read is needed to distinguish exact EOF from an
+    /// over-limit stream.
+    pub(crate) fn remaining_decoded(&self) -> usize {
+        self.limits
+            .max_decoded_bytes
+            .saturating_sub(self.decoded_bytes)
+    }
+
+    /// Snapshot monotonic internal counters without lending or resetting the unique budget.
+    pub(crate) fn progress(&self, records_emitted: usize) -> RecordDecodeProgress {
+        RecordDecodeProgress {
+            decoded_bytes: self.decoded_bytes,
+            records_begun: self.records,
+            records_emitted,
+            headers_declared: self.headers,
+            work_units: self.work_units,
+        }
     }
 
     pub(crate) fn charge_decoded(&mut self, bytes: usize) -> Result<(), RecordDecodeError> {
@@ -342,27 +431,36 @@ impl<'source> Records<'source> {
     }
 
     /// Consume the stream and prove exact declared-count and byte exhaustion.
-    pub fn finish(mut self) -> Result<(), RecordDecodeError> {
-        if let Some(error) = self.failure.take() {
-            return Err(error);
-        }
-        self.charge_remaining()?;
-        let declared =
-            usize::try_from(self.declared).map_err(|_| RecordDecodeError::NegativeLength {
-                field: "record count",
-                actual: self.declared,
-            })?;
-        if self.emitted != declared {
-            return Err(RecordDecodeError::RecordCountMismatch {
-                declared: self.declared,
-                actual: self.emitted,
-            });
-        }
-        let remaining = self.source.len() - self.position;
-        if remaining > 0 {
-            return Err(RecordDecodeError::TrailingBytes(remaining));
-        }
-        Ok(())
+    ///
+    /// Success returns final resource evidence. Failure carries the same evidence alongside the
+    /// typed error, so terminal validation cannot discard request-wide accounting.
+    pub fn finish(mut self) -> Result<RecordDecodeProgress, RecordDecodeFailure> {
+        let result = (|| {
+            if let Some(error) = self.failure.take() {
+                return Err(error);
+            }
+            self.charge_remaining()?;
+            let declared =
+                usize::try_from(self.declared).map_err(|_| RecordDecodeError::NegativeLength {
+                    field: "record count",
+                    actual: self.declared,
+                })?;
+            if self.emitted != declared {
+                return Err(RecordDecodeError::RecordCountMismatch {
+                    declared: self.declared,
+                    actual: self.emitted,
+                });
+            }
+            let remaining = self.source.len() - self.position;
+            if remaining > 0 {
+                return Err(RecordDecodeError::TrailingBytes(remaining));
+            }
+            Ok(())
+        })();
+        let progress = self.progress();
+        result
+            .map(|()| progress)
+            .map_err(|error| RecordDecodeFailure::new(error, progress))
     }
 
     /// Signed count declared by the magic-v2 batch.
@@ -373,6 +471,11 @@ impl<'source> Records<'source> {
     /// Records successfully emitted so far.
     pub fn emitted_count(&self) -> usize {
         self.emitted
+    }
+
+    /// Snapshot attempted resource use, including counters charged by the first failed operation.
+    pub fn progress(&self) -> RecordDecodeProgress {
+        self.budget.progress(self.emitted)
     }
 
     fn next_boundary(&mut self) -> Result<Range<usize>, RecordDecodeError> {
@@ -402,15 +505,21 @@ impl<'source> Records<'source> {
     }
 
     fn exhausted(&mut self) -> Result<(), RecordDecodeError> {
-        self.terminal = true;
+        if self.terminal {
+            return Ok(());
+        }
         let remaining = self.source.len() - self.position;
         if remaining > 0 {
-            self.budget.charge_decoded(remaining)?;
+            if let Err(error) = self.budget.charge_decoded(remaining) {
+                self.failure = Some(error.clone());
+                return Err(error);
+            }
             self.position = self.source.len();
             let error = RecordDecodeError::TrailingBytes(remaining);
             self.failure = Some(error.clone());
             return Err(error);
         }
+        self.terminal = true;
         Ok(())
     }
 
@@ -585,14 +694,92 @@ impl<'batch> Batch<'batch> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ParsedRecord {
+pub(crate) struct ParsedRecord<Bytes = Range<usize>> {
     attributes: u8,
     timestamp_delta: i64,
     offset_delta: i32,
-    key: Option<Range<usize>>,
-    value: Option<Range<usize>>,
+    key: Option<Bytes>,
+    value: Option<Bytes>,
     headers: Range<usize>,
     header_count: usize,
+}
+
+/// Adapter seam beneath the one canonical Kafka record-field grammar.
+///
+/// Implementations decide whether fields borrow frame ranges or are streamed and discarded, but
+/// cannot change field order, nullability, limit categories, header semantics, or exact-body
+/// exhaustion.
+trait RecordBodyCursor {
+    type Bytes;
+
+    fn limits(&self) -> RecordDecodeLimits;
+    fn u8(&mut self, field: &'static str) -> Result<u8, RecordDecodeError>;
+    fn varint_i32(&mut self, field: &'static str) -> Result<i32, RecordDecodeError>;
+    fn varint_i64(&mut self, field: &'static str) -> Result<i64, RecordDecodeError>;
+    fn nullable_bytes(
+        &mut self,
+        field: &'static str,
+        kind: RecordDecodeLimit,
+        limit: usize,
+    ) -> Result<Option<Self::Bytes>, RecordDecodeError>;
+    fn required_bytes(
+        &mut self,
+        field: &'static str,
+        kind: RecordDecodeLimit,
+        limit: usize,
+    ) -> Result<Self::Bytes, RecordDecodeError>;
+    fn add_headers(&mut self, headers: usize) -> Result<(), RecordDecodeError>;
+    fn position(&self) -> usize;
+    fn finish_body(&self) -> Result<(), RecordDecodeError>;
+}
+
+fn parse_record_fields<Cursor>(
+    cursor: &mut Cursor,
+) -> Result<ParsedRecord<Cursor::Bytes>, RecordDecodeError>
+where
+    Cursor: RecordBodyCursor,
+{
+    let limits = cursor.limits();
+    let attributes = cursor.u8("record attributes")?;
+    let timestamp_delta = cursor.varint_i64("timestamp delta")?;
+    let offset_delta = cursor.varint_i32("offset delta")?;
+    let key = cursor.nullable_bytes("key", RecordDecodeLimit::KeyBytes, limits.max_key_bytes)?;
+    let value = cursor.nullable_bytes(
+        "value",
+        RecordDecodeLimit::ValueBytes,
+        limits.max_value_bytes,
+    )?;
+    let header_count = cursor.varint_i32("header count")?;
+    let header_count =
+        usize::try_from(header_count).map_err(|_| RecordDecodeError::NegativeLength {
+            field: "header count",
+            actual: header_count,
+        })?;
+    cursor.add_headers(header_count)?;
+    let headers_start = cursor.position();
+    for _ in 0..header_count {
+        let _ = cursor.required_bytes(
+            "header key",
+            RecordDecodeLimit::HeaderKeyBytes,
+            limits.max_header_key_bytes,
+        )?;
+        let _ = cursor.nullable_bytes(
+            "header value",
+            RecordDecodeLimit::HeaderValueBytes,
+            limits.max_header_value_bytes,
+        )?;
+    }
+    cursor.finish_body()?;
+
+    Ok(ParsedRecord {
+        attributes,
+        timestamp_delta,
+        offset_delta,
+        key,
+        value,
+        headers: headers_start..cursor.position(),
+        header_count,
+    })
 }
 
 pub(crate) fn parse_record_body(
@@ -606,55 +793,7 @@ pub(crate) fn parse_record_body(
     )?;
     budget.begin_record()?;
     let mut cursor = RecordCursor::semantic(body, budget);
-    let attributes = cursor.u8("record attributes")?;
-    let timestamp_delta = cursor.varint_i64("timestamp delta")?;
-    let offset_delta = cursor.varint_i32("offset delta")?;
-    let key = cursor.nullable_bytes(
-        "key",
-        RecordDecodeLimit::KeyBytes,
-        cursor.budget.limits.max_key_bytes,
-    )?;
-    let value = cursor.nullable_bytes(
-        "value",
-        RecordDecodeLimit::ValueBytes,
-        cursor.budget.limits.max_value_bytes,
-    )?;
-    let header_count = cursor.varint_i32("header count")?;
-    let header_count =
-        usize::try_from(header_count).map_err(|_| RecordDecodeError::NegativeLength {
-            field: "header count",
-            actual: header_count,
-        })?;
-    cursor.budget.add_headers(header_count)?;
-    let headers_start = cursor.position;
-    for _ in 0..header_count {
-        let _ = cursor.required_bytes(
-            "header key",
-            RecordDecodeLimit::HeaderKeyBytes,
-            cursor.budget.limits.max_header_key_bytes,
-        )?;
-        let _ = cursor.nullable_bytes(
-            "header value",
-            RecordDecodeLimit::HeaderValueBytes,
-            cursor.budget.limits.max_header_value_bytes,
-        )?;
-    }
-    if cursor.position != body.len() {
-        return Err(RecordDecodeError::RecordLengthMismatch {
-            declared: body.len(),
-            actual: cursor.position,
-        });
-    }
-
-    Ok(ParsedRecord {
-        attributes,
-        timestamp_delta,
-        offset_delta,
-        key,
-        value,
-        headers: headers_start..body.len(),
-        header_count,
-    })
+    parse_record_fields(&mut cursor)
 }
 
 #[derive(Debug)]
@@ -724,35 +863,11 @@ impl<'source, 'budget> RecordCursor<'source, 'budget> {
     }
 
     fn varint_i32(&mut self, field: &'static str) -> Result<i32, RecordDecodeError> {
-        let mut value = 0u32;
-        for index in 0..MAX_VARINT_BYTES {
-            let byte = self.u8(field)?;
-            let shift = index * 7;
-            if index + 1 == MAX_VARINT_BYTES && byte > LAST_VARINT_PAYLOAD {
-                return Err(RecordDecodeError::InvalidVarint { field });
-            }
-            value |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(((value >> 1) as i32) ^ -((value & 1) as i32));
-            }
-        }
-        Err(RecordDecodeError::InvalidVarint { field })
+        decode_varint_i32(field, || self.u8(field))
     }
 
     fn varint_i64(&mut self, field: &'static str) -> Result<i64, RecordDecodeError> {
-        let mut value = 0u64;
-        for index in 0..MAX_VARLONG_BYTES {
-            let byte = self.u8(field)?;
-            let shift = index * 7;
-            if index + 1 == MAX_VARLONG_BYTES && byte > LAST_VARLONG_PAYLOAD {
-                return Err(RecordDecodeError::InvalidVarint { field });
-            }
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(((value >> 1) as i64) ^ -((value & 1) as i64));
-            }
-        }
-        Err(RecordDecodeError::InvalidVarint { field })
+        decode_varint_i64(field, || self.u8(field))
     }
 
     fn nullable_bytes(
@@ -786,6 +901,62 @@ impl<'source, 'budget> RecordCursor<'source, 'budget> {
         })?;
         check_limit(kind, limit, length)?;
         self.take(length, field)
+    }
+}
+
+impl RecordBodyCursor for RecordCursor<'_, '_> {
+    type Bytes = Range<usize>;
+
+    fn limits(&self) -> RecordDecodeLimits {
+        self.budget.limits()
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, RecordDecodeError> {
+        RecordCursor::u8(self, field)
+    }
+
+    fn varint_i32(&mut self, field: &'static str) -> Result<i32, RecordDecodeError> {
+        RecordCursor::varint_i32(self, field)
+    }
+
+    fn varint_i64(&mut self, field: &'static str) -> Result<i64, RecordDecodeError> {
+        RecordCursor::varint_i64(self, field)
+    }
+
+    fn nullable_bytes(
+        &mut self,
+        field: &'static str,
+        kind: RecordDecodeLimit,
+        limit: usize,
+    ) -> Result<Option<Self::Bytes>, RecordDecodeError> {
+        RecordCursor::nullable_bytes(self, field, kind, limit)
+    }
+
+    fn required_bytes(
+        &mut self,
+        field: &'static str,
+        kind: RecordDecodeLimit,
+        limit: usize,
+    ) -> Result<Self::Bytes, RecordDecodeError> {
+        RecordCursor::required_bytes(self, field, kind, limit)
+    }
+
+    fn add_headers(&mut self, headers: usize) -> Result<(), RecordDecodeError> {
+        self.budget.add_headers(headers)
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+
+    fn finish_body(&self) -> Result<(), RecordDecodeError> {
+        if self.position != self.end {
+            return Err(RecordDecodeError::RecordLengthMismatch {
+                declared: self.end,
+                actual: self.position,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -830,24 +1001,15 @@ impl<'source> ReplayCursor<'source> {
     }
 
     fn varint_i32(&mut self, field: &'static str) -> Result<i32, RecordDecodeError> {
-        let mut value = 0u32;
-        for index in 0..MAX_VARINT_BYTES {
+        decode_varint_i32(field, || {
             let byte = *self
                 .source
                 .get(self.position)
                 .filter(|_| self.position < self.end)
                 .ok_or(RecordDecodeError::Truncated(field))?;
             self.position += 1;
-            let shift = index * 7;
-            if index + 1 == MAX_VARINT_BYTES && byte > LAST_VARINT_PAYLOAD {
-                return Err(RecordDecodeError::InvalidVarint { field });
-            }
-            value |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(((value >> 1) as i32) ^ -((value & 1) as i32));
-            }
-        }
-        Err(RecordDecodeError::InvalidVarint { field })
+            Ok(byte)
+        })
     }
 
     fn take(
@@ -868,6 +1030,44 @@ impl<'source> ReplayCursor<'source> {
     }
 }
 
+pub(crate) fn decode_varint_i32(
+    field: &'static str,
+    mut next_byte: impl FnMut() -> Result<u8, RecordDecodeError>,
+) -> Result<i32, RecordDecodeError> {
+    let mut value = 0u32;
+    for index in 0..MAX_VARINT_BYTES {
+        let byte = next_byte()?;
+        let shift = index * 7;
+        if index + 1 == MAX_VARINT_BYTES && byte > LAST_VARINT_PAYLOAD {
+            return Err(RecordDecodeError::InvalidVarint { field });
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(((value >> 1) as i32) ^ -((value & 1) as i32));
+        }
+    }
+    Err(RecordDecodeError::InvalidVarint { field })
+}
+
+pub(crate) fn decode_varint_i64(
+    field: &'static str,
+    mut next_byte: impl FnMut() -> Result<u8, RecordDecodeError>,
+) -> Result<i64, RecordDecodeError> {
+    let mut value = 0u64;
+    for index in 0..MAX_VARLONG_BYTES {
+        let byte = next_byte()?;
+        let shift = index * 7;
+        if index + 1 == MAX_VARLONG_BYTES && byte > LAST_VARLONG_PAYLOAD {
+            return Err(RecordDecodeError::InvalidVarint { field });
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(((value >> 1) as i64) ^ -((value & 1) as i64));
+        }
+    }
+    Err(RecordDecodeError::InvalidVarint { field })
+}
+
 fn check_limit(
     kind: RecordDecodeLimit,
     limit: usize,
@@ -881,5 +1081,44 @@ fn check_limit(
         })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailing_decoded_limit_failure_is_sticky_and_preserves_progress() {
+        let limits = RecordDecodeLimits {
+            max_record_bytes: 0,
+            max_decoded_bytes: 0,
+            max_records: 0,
+            max_key_bytes: 0,
+            max_value_bytes: 0,
+            max_header_key_bytes: 0,
+            max_header_value_bytes: 0,
+            max_headers: 0,
+            max_work_units: 1,
+        };
+        let mut records = Records {
+            source: &[0],
+            position: 0,
+            declared: 0,
+            emitted: 0,
+            budget: RecordDecodeBudget::new(limits),
+            terminal: false,
+            failure: None,
+        };
+        let expected = RecordDecodeError::LimitExceeded {
+            kind: RecordDecodeLimit::DecodedBytes,
+            limit: 0,
+            actual: 1,
+        };
+
+        assert_eq!(expected, records.next_record().expect_err("decoded limit"));
+        assert_eq!(1, records.progress().decoded_bytes);
+        assert_eq!(expected, records.next_record().expect_err("sticky failure"));
+        assert_eq!(1, records.progress().decoded_bytes);
     }
 }

@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::io::Cursor;
+
 use bytes::{BufMut as _, Bytes, BytesMut};
 use tansu_sans_io::{
     BatchAttribute, Compression, Encode as _,
     record::{
         Header, Record, borrowed::RecordDecodeError, borrowed::RecordDecodeLimit,
-        borrowed::RecordDecodeLimits, borrowed::RecordSet, deflated, inflated,
+        borrowed::RecordDecodeLimits, borrowed::RecordSet, borrowed::ValueRecords, deflated,
+        inflated,
     },
 };
 
@@ -51,6 +54,47 @@ fn source_records() -> tansu_sans_io::Result<Vec<Record>> {
             .value(Some(Bytes::new()))
             .build()?,
     ])
+}
+
+#[test]
+fn failed_borrowed_decode_exposes_exact_immutable_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let record = Record::builder()
+        .value(Some(Bytes::from_static(b"too-large")))
+        .build()?;
+    let encoded = Bytes::from(batch_from_records(Compression::None, vec![record])?);
+    let set = RecordSet::from_bytes(&encoded)?;
+    let batch = set.batches().next().expect("batch");
+    let limits = RecordDecodeLimits {
+        max_value_bytes: 4,
+        ..RecordDecodeLimits::default()
+    };
+    let mut records = batch.records_with_limits(limits)?;
+
+    assert!(matches!(
+        records.next_record(),
+        Err(RecordDecodeError::LimitExceeded {
+            kind: RecordDecodeLimit::ValueBytes,
+            limit: 4,
+            actual: 9,
+        })
+    ));
+    assert_eq!(batch.record_data().len(), records.progress().decoded_bytes);
+    assert_eq!(1, records.progress().records_begun);
+    assert_eq!(0, records.progress().records_emitted);
+    assert_eq!(0, records.progress().headers_declared);
+    let progress = records.progress();
+    assert_eq!(progress, records.progress());
+    assert_eq!(
+        records.next_record().expect_err("sticky first error"),
+        RecordDecodeError::LimitExceeded {
+            kind: RecordDecodeLimit::ValueBytes,
+            limit: 4,
+            actual: 9,
+        }
+    );
+    assert_eq!(progress, records.progress());
+    Ok(())
 }
 
 fn set_headers(record: &mut Record, headers: Vec<Header>) -> tansu_sans_io::Result<()> {
@@ -115,6 +159,99 @@ fn encoded_batch_with_data(record_count: i32, record_data: Bytes) -> tansu_sans_
     Ok(batch.into())
 }
 
+fn parity_limits(record_data_bytes: usize) -> RecordDecodeLimits {
+    RecordDecodeLimits {
+        max_record_bytes: record_data_bytes,
+        max_decoded_bytes: record_data_bytes,
+        max_records: 4,
+        max_key_bytes: record_data_bytes,
+        max_value_bytes: record_data_bytes,
+        max_header_key_bytes: record_data_bytes,
+        max_header_value_bytes: record_data_bytes,
+        max_headers: 4,
+        max_work_units: 1_000,
+    }
+}
+
+fn assert_adapter_error_parity(
+    record_data: Bytes,
+    record_count: i32,
+    limits: RecordDecodeLimits,
+    expected: RecordDecodeError,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let encoded = encoded_batch_with_data(record_count, record_data.clone())?;
+    let set = RecordSet::from_bytes(&encoded)?;
+    let batch = set.batches().next().expect("batch");
+    let mut borrowed = batch.records_with_limits(limits)?;
+    assert_eq!(
+        expected,
+        borrowed.next_record().expect_err("borrowed adapter error")
+    );
+
+    let mut scratch = vec![0u8; limits.max_value_bytes];
+    let mut streaming =
+        ValueRecords::new(Cursor::new(record_data), &mut scratch, record_count, limits)?;
+    assert_eq!(
+        expected,
+        streaming.next_value().expect_err("streaming adapter error")
+    );
+    Ok(())
+}
+
+#[test]
+fn borrowed_and_streaming_adapters_share_exact_grammar_errors()
+-> Result<(), Box<dyn std::error::Error>> {
+    let zero_body = Bytes::from_static(b"\x00");
+    assert_adapter_error_parity(
+        zero_body.clone(),
+        1,
+        parity_limits(zero_body.len()),
+        RecordDecodeError::Truncated("record attributes"),
+    )?;
+
+    let oversized_key = Bytes::from_static(b"\x08\x00\x00\x00\x14");
+    let mut oversized_key_limits = parity_limits(oversized_key.len());
+    oversized_key_limits.max_key_bytes = 10;
+    assert_adapter_error_parity(
+        oversized_key.clone(),
+        1,
+        oversized_key_limits,
+        RecordDecodeError::Truncated("key"),
+    )?;
+
+    let record = Record::builder()
+        .value(Some(Bytes::from_static(b"too-large")))
+        .build()?;
+    let record_data = (&[record][..]).encode()?;
+    let mut value_limits = parity_limits(record_data.len());
+    value_limits.max_value_bytes = 4;
+    assert_adapter_error_parity(
+        record_data.clone(),
+        1,
+        value_limits,
+        RecordDecodeError::LimitExceeded {
+            kind: RecordDecodeLimit::ValueBytes,
+            limit: 4,
+            actual: 9,
+        },
+    )?;
+
+    let declared_body = record_data.len() - 1;
+    let mut record_limits = parity_limits(record_data.len());
+    record_limits.max_record_bytes = declared_body - 1;
+    assert_adapter_error_parity(
+        record_data,
+        1,
+        record_limits,
+        RecordDecodeError::LimitExceeded {
+            kind: RecordDecodeLimit::RecordBytes,
+            limit: declared_body - 1,
+            actual: declared_body,
+        },
+    )?;
+    Ok(())
+}
+
 #[test]
 fn lends_scalars_null_empty_values_headers_and_frame_storage()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -158,7 +295,7 @@ fn lends_scalars_null_empty_values_headers_and_frame_storage()
 
     assert!(stream.next_record()?.is_none());
     assert_eq!(2, stream.emitted_count());
-    stream.finish()?;
+    let _ = stream.finish()?;
     Ok(())
 }
 
@@ -181,7 +318,7 @@ fn null_and_empty_record_values_are_distinct() -> Result<(), Box<dyn std::error:
         assert_eq!(Some(&b""[..]), empty.value());
     }
     assert!(stream.next_record()?.is_none());
-    stream.finish()?;
+    let _ = stream.finish()?;
     Ok(())
 }
 
@@ -196,13 +333,15 @@ fn finish_and_full_exhaustion_detect_count_and_trailing_mismatches()
     let batch = set.batches().next().expect("batch");
     let mut early = batch.records()?;
     let _ = early.next_record()?.expect("first");
+    let failure = early.finish().expect_err("early finish");
     assert!(matches!(
-        early.finish(),
-        Err(RecordDecodeError::RecordCountMismatch {
+        failure.error(),
+        RecordDecodeError::RecordCountMismatch {
             declared: 2,
             actual: 1,
-        })
+        }
     ));
+    assert_eq!(1, failure.progress().records_emitted);
 
     let encoded = encoded_batch_with_data(1, record_data.clone())?;
     let set = RecordSet::from_bytes(&encoded)?;

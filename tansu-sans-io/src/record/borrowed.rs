@@ -29,8 +29,8 @@ use crate::{DecodeLimit, DecodeLimits, Error, Result, borrowed::DecodeBudget};
 pub(crate) mod records;
 
 pub use records::{
-    HeaderRef, Headers, RecordDecodeError, RecordDecodeLimit, RecordDecodeLimits, RecordRef,
-    Records,
+    HeaderRef, Headers, RecordDecodeError, RecordDecodeFailure, RecordDecodeLimit,
+    RecordDecodeLimits, RecordDecodeProgress, RecordRef, Records, ValueRecords, ValueRef,
 };
 
 /// Offset of `base_offset`, the first field in Kafka's magic-v2 record batch layout.
