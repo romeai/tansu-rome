@@ -28,10 +28,12 @@ use crate::Compression;
 mod gzip;
 mod lz4;
 mod snappy;
+mod zstd;
 
 pub use gzip::GzipDecoder;
 pub use lz4::Lz4Decoder;
 pub use snappy::XerialSnappyDecoder;
+pub use zstd::ZstdDecoder;
 
 /// Zstandard's backend minimum window-log parameter; exact preflight may enforce a smaller
 /// single-segment byte ceiling, but the native decoder still retains at least this state class.
