@@ -417,7 +417,9 @@ fn config_type() {
 fn allocation_size() -> Result<()> {
     let mut q: Option<String> = Some("hey".into());
 
-    assert_eq!(size_of::<u16>() + 3, q.maximum_allocation_size()?);
+    // One model is encoded by both legacy and compact strings; the response
+    // preflight reserves the larger unsigned-varint prefix.
+    assert_eq!(5 + 3, q.maximum_allocation_size()?);
 
     q = None;
     assert_eq!(size_of::<u32>(), q.maximum_allocation_size()?);

@@ -798,7 +798,9 @@ fn maximum_allocation_size(name: &Type, fields: &[Field], include_tag: bool) -> 
             let f = field.ident();
 
             quote! {
-                total += self.#f.maximum_allocation_size()?
+                total = total
+                    .checked_add(self.#f.maximum_allocation_size()?)
+                    .ok_or(crate::Error::Overflow)?
             }
         })
         .collect::<Vec<_>>();

@@ -16,7 +16,7 @@ mod de;
 mod ser;
 
 use super::varint::UnsignedVarInt;
-use crate::{ByteSize, Result};
+use crate::{ByteSize, Error, Result};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as _, SeqAccess, Visitor},
@@ -180,7 +180,7 @@ impl ByteSize for TagField {
         ]
         .iter()
         .try_fold(self.data().len(), |acc, uvi| {
-            uvi.size_in_bytes().map(|size_in_bytes| acc + size_in_bytes)
+            acc.checked_add(uvi.size_in_bytes()?).ok_or(Error::Overflow)
         })
     }
 }
@@ -305,10 +305,11 @@ impl ByteSize for TagBuffer {
     fn size_in_bytes(&self) -> Result<usize> {
         chain(
             once(UnsignedVarInt::try_from(self.0.len()).and_then(|uvi| uvi.size_in_bytes())),
-            self.0.iter().map(|tag| tag.size_in_bytes()),
+            self.0.iter().map(ByteSize::size_in_bytes),
         )
-        .collect::<Result<Vec<_>>>()
-        .map(|length| length.iter().sum::<usize>())
+        .try_fold(0usize, |total, size| {
+            total.checked_add(size?).ok_or(Error::Overflow)
+        })
     }
 }
 

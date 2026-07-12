@@ -261,7 +261,10 @@ where
 
 impl MaximumAllocationSize for Bytes {
     fn maximum_allocation_size(&self) -> Result<usize> {
-        Ok(size_of::<i32>() + self.len())
+        // Flexible byte lengths use an unsigned varint that can occupy five
+        // bytes. Reserving the larger prefix keeps the encoder inside its
+        // pre-admitted capacity for both legacy and compact encodings.
+        5usize.checked_add(self.len()).ok_or(Error::Overflow)
     }
 }
 
@@ -303,7 +306,9 @@ impl MaximumAllocationSize for i8 {
 
 impl MaximumAllocationSize for String {
     fn maximum_allocation_size(&self) -> Result<usize> {
-        Ok(size_of::<i16>() + self.len())
+        // The same model is used by legacy and flexible versions; five bytes
+        // covers every compact unsigned-varint length prefix.
+        5usize.checked_add(self.len()).ok_or(Error::Overflow)
     }
 }
 
@@ -324,10 +329,14 @@ where
     T: MaximumAllocationSize,
 {
     fn maximum_allocation_size(&self) -> Result<usize> {
-        self.iter()
-            .map(MaximumAllocationSize::maximum_allocation_size)
-            .collect::<Result<Vec<_>>>()
-            .map(|elements| size_of::<i32>() + elements.iter().sum::<usize>())
+        // Compact array cardinality is an unsigned varint of at most five
+        // bytes, while legacy arrays need only four. Folding in place keeps
+        // response preflight independent of peer-visible cardinality.
+        self.iter().try_fold(5usize, |total, element| {
+            total
+                .checked_add(element.maximum_allocation_size()?)
+                .ok_or(Error::Overflow)
+        })
     }
 }
 
@@ -452,6 +461,10 @@ pub enum Error {
     Poison,
     RecordDataNotExhausted,
     ResponseFrame,
+    ResponseWireLimitExceeded {
+        required: usize,
+        limit: usize,
+    },
     Snap(#[from] snap::Error),
     StringWithoutApiVersion,
     StringWithoutLength,
@@ -646,9 +659,12 @@ impl IntoVersion for Frame {
 impl MaximumAllocationSize for Frame {
     #[instrument(skip_all, ret)]
     fn maximum_allocation_size(&self) -> Result<usize> {
-        Ok(self.size.maximum_allocation_size()?
-            + self.header.maximum_allocation_size()?
-            + self.body.maximum_allocation_size()?)
+        let size = self.size.maximum_allocation_size()?;
+        let header = self.header.maximum_allocation_size()?;
+        let body = self.body.maximum_allocation_size()?;
+        size.checked_add(header)
+            .and_then(|total| total.checked_add(body))
+            .ok_or(Error::Overflow)
     }
 }
 
@@ -746,21 +762,49 @@ impl Frame {
     /// serialize an API response into a frame of bytes
     #[instrument(skip(header, body))]
     pub fn response(header: Header, body: Body, api_key: i16, api_version: i16) -> Result<Bytes> {
+        Self::response_with_limit(header, body, api_key, api_version, usize::MAX)
+    }
+
+    /// Serialize an API response without reserving beyond `maximum_wire_bytes`.
+    ///
+    /// The generated model's allocation-size traversal runs before the output
+    /// buffer exists. Its result is a conservative wire-capacity bound, so a
+    /// caller ceiling may reject a model whose compact encoding would be
+    /// smaller but can never observe an oversized encoder allocation after it
+    /// has already occurred.
+    #[instrument(skip(header, body))]
+    pub fn response_with_limit(
+        header: Header,
+        body: Body,
+        api_key: i16,
+        api_version: i16,
+        maximum_wire_bytes: usize,
+    ) -> Result<Bytes> {
         let frame = Frame {
             size: 0,
             header: header.into_version(api_version),
             body: body.into_version(api_version),
         };
 
-        let mut encoder = Encoder::response(
-            frame
-                .maximum_allocation_size()
-                .map(BytesMut::with_capacity)?,
-            api_key,
-            api_version,
-        );
+        let required = frame.maximum_allocation_size()?;
+        if required > maximum_wire_bytes {
+            return Err(Error::ResponseWireLimitExceeded {
+                required,
+                limit: maximum_wire_bytes,
+            });
+        }
+        let mut encoder =
+            Encoder::response(BytesMut::with_capacity(required), api_key, api_version);
         frame.serialize(&mut encoder)?;
-        fix_length(BytesMut::from(encoder)).inspect(|encoded| debug!(encoded = ?&encoded[..]))
+        let encoded = fix_length(BytesMut::from(encoder))?;
+        if encoded.len() > maximum_wire_bytes {
+            return Err(Error::ResponseWireLimitExceeded {
+                required: encoded.len(),
+                limit: maximum_wire_bytes,
+            });
+        }
+        debug!(encoded = ?&encoded[..]);
+        Ok(encoded)
     }
 
     /// deserialize bytes into an API response frame
@@ -865,10 +909,17 @@ impl MaximumAllocationSize for Header {
                 api_version,
                 correlation_id,
                 client_id,
-            } => Ok(api_key.maximum_allocation_size()?
-                + api_version.maximum_allocation_size()?
-                + correlation_id.maximum_allocation_size()?
-                + client_id.maximum_allocation_size()?),
+            } => {
+                let api_key = api_key.maximum_allocation_size()?;
+                let api_version = api_version.maximum_allocation_size()?;
+                let correlation_id = correlation_id.maximum_allocation_size()?;
+                let client_id = client_id.maximum_allocation_size()?;
+                api_key
+                    .checked_add(api_version)
+                    .and_then(|total| total.checked_add(correlation_id))
+                    .and_then(|total| total.checked_add(client_id))
+                    .ok_or(Error::Overflow)
+            }
             Self::Response { correlation_id } => correlation_id.maximum_allocation_size(),
         }
     }
