@@ -35,7 +35,7 @@ use rama::{
 };
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter, Interest},
+    io::{AsyncReadExt, AsyncWriteExt, Interest},
     net::{TcpListener, TcpStream},
     sync::{AcquireError, OwnedSemaphorePermit, Semaphore},
     task::{Id, JoinError, JoinSet},
@@ -1765,10 +1765,9 @@ impl<S, State, P, M> AdmittedTcpBytesService<S, State, P, M> {
         let AdmittedReply { payload, lease, .. } = reply;
         let _lease = lease;
         if let Reply::Frame(payload) = payload {
-            let mut writer = BufWriter::new(stream);
             let write = async {
-                writer.write_all(&payload).await?;
-                writer.flush().await
+                stream.write_all(&payload).await?;
+                stream.flush().await
             };
             if let Some(timeout) = transport.response_write_timeout() {
                 tokio::time::timeout(timeout, write).await.map_err(|_| {
@@ -1938,10 +1937,9 @@ where
     where
         W: AsyncWriteExt + Unpin,
     {
-        let mut w = BufWriter::new(req);
         let write = async {
-            w.write_all(&frame).await.inspect_err(|err| error!(?err))?;
-            w.flush().await
+            req.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+            req.flush().await
         };
         let result: io::Result<()> = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, write)
