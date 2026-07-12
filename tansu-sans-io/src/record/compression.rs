@@ -25,6 +25,10 @@ use std::{
 
 use crate::Compression;
 
+mod gzip;
+
+pub use gzip::GzipDecoder;
+
 /// Zstandard's backend minimum window-log parameter; exact preflight may enforce a smaller
 /// single-segment byte ceiling, but the native decoder still retains at least this state class.
 pub const ZSTD_BACKEND_MIN_WINDOW_LOG: u32 = 10;
