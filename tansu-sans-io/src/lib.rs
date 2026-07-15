@@ -122,6 +122,7 @@ pub use borrowed::BorrowedWorkBudget;
 pub mod consumer;
 pub mod de;
 pub mod primitive;
+mod produce_response_encode;
 pub mod record;
 pub mod resource;
 pub mod ser;
@@ -129,6 +130,13 @@ pub mod ser;
 use bytes::{Buf, BufMut, Bytes, BytesMut, TryGetError};
 pub use de::Decoder;
 use primitive::tagged::TagBuffer;
+#[doc(hidden)]
+pub use produce_response_encode::encode as encode_produce_response_view;
+pub use produce_response_encode::{
+    PRODUCE_RESPONSE_FLEXIBLE_START, PRODUCE_RESPONSE_MAX_VERSION, PRODUCE_RESPONSE_MIN_VERSION,
+    ProduceCurrentLeader, ProduceNodeEndpointView, ProducePartitionResponseView,
+    ProduceRecordErrorView, ProduceResponseView, ProduceTopicResponseView,
+};
 use record::deflated::Frame as RecordBatch;
 pub use ser::Encoder;
 use serde::{Deserialize, Serialize};
@@ -451,6 +459,19 @@ pub enum Error {
     InvalidFrameSize(i32),
     Message(String),
     MessageMaxSizeExceeded(usize),
+    ProduceResponseSizeLimitExceeded {
+        limit: usize,
+        actual: usize,
+    },
+    ProduceResponseViewChanged {
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedProduceResponseVersion {
+        version: i16,
+        minimum: i16,
+        maximum: i16,
+    },
     NoSuchField(&'static str),
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
@@ -780,6 +801,19 @@ impl Frame {
         api_version: i16,
         maximum_wire_bytes: usize,
     ) -> Result<Bytes> {
+        if api_key == ProduceResponse::KEY
+            && let Body::ProduceResponse(response) = &body
+        {
+            let Header::Response { correlation_id } = header else {
+                return Err(Error::ResponseFrame);
+            };
+            return produce_response_encode::encode(
+                response,
+                api_version,
+                correlation_id,
+                maximum_wire_bytes,
+            );
+        }
         let frame = Frame {
             size: 0,
             header: header.into_version(api_version),
