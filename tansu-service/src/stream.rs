@@ -34,6 +34,7 @@ use rama::{
     layer::limit::policy::{Policy, PolicyOutput, PolicyResult, UnlimitedPolicy},
 };
 use socket2::{SockRef, TcpKeepalive};
+use tansu_sans_io::ApiKey as _;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, Interest},
     net::{TcpListener, TcpStream},
@@ -207,6 +208,22 @@ impl<L, T> AdmittedFrame<L, T> {
     pub fn reply<U>(self, payload: U) -> AdmittedReply<L, U> {
         AdmittedReply::from_frame(self, payload)
     }
+
+    /// Encode one semantic Produce reply using only this admitted request's
+    /// fixed API version and correlation id.
+    ///
+    /// The application supplies semantic response traversal and a wire-size
+    /// safety bound, but cannot substitute protocol identity.
+    pub fn reply_produce<V>(
+        self,
+        payload: V,
+        maximum_frame_bytes: usize,
+    ) -> Result<AdmittedReply<L, Reply>, tansu_sans_io::Error>
+    where
+        V: tansu_sans_io::ProduceResponseView,
+    {
+        self.reply(payload).encode_produce(maximum_frame_bytes)
+    }
 }
 
 impl<L, T> AdmittedFrame<L, T>
@@ -299,6 +316,32 @@ impl<L, T> AdmittedReply<L, T> {
             payload: map(self.payload),
             lease: self.lease,
         }
+    }
+}
+
+impl<L, V> AdmittedReply<L, V>
+where
+    V: tansu_sans_io::ProduceResponseView,
+{
+    /// Encode this semantic Produce reply from its retained admitted head.
+    pub fn encode_produce(
+        self,
+        maximum_frame_bytes: usize,
+    ) -> Result<AdmittedReply<L, Reply>, tansu_sans_io::Error> {
+        if self.head.api_key != tansu_sans_io::ProduceResponse::KEY {
+            return Err(tansu_sans_io::Error::NoSuchRequest(self.head.api_key));
+        }
+        let payload = tansu_sans_io::encode_produce_response_view(
+            &self.payload,
+            self.head.api_version,
+            self.head.correlation_id,
+            maximum_frame_bytes,
+        )?;
+        Ok(AdmittedReply {
+            head: self.head,
+            payload: Reply::Frame(payload),
+            lease: self.lease,
+        })
     }
 }
 
@@ -1938,7 +1981,9 @@ where
         W: AsyncWriteExt + Unpin,
     {
         let write = async {
-            req.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+            req.write_all(&frame)
+                .await
+                .inspect_err(|err| error!(?err))?;
             req.flush().await
         };
         let result: io::Result<()> = if let Some(timeout) = timeout {
@@ -3134,6 +3179,51 @@ mod tests {
         assert_eq!(91, evidence.identity);
         assert_eq!(expected_evidence, ptr::from_ref(evidence));
         assert_eq!(ptr::from_ref(frame.evidence()), ptr::from_ref(evidence));
+    }
+
+    #[test]
+    fn admitted_produce_reply_uses_only_the_retained_request_identity() {
+        let frame = AdmittedFrame {
+            head: RequestHead {
+                body_len: 8,
+                api_key: ProduceResponse::KEY,
+                api_version: 9,
+                correlation_id: 42,
+            },
+            payload: bytes::Bytes::new(),
+            lease: (),
+        };
+        let reply = frame
+            .reply_produce(
+                ProduceResponse::default()
+                    .responses(Some(vec![]))
+                    .throttle_time_ms(Some(0)),
+                64,
+            )
+            .unwrap();
+        let Reply::Frame(encoded) = reply.payload else {
+            panic!("Produce with acknowledgements must encode one frame");
+        };
+        let decoded = Frame::response_from_bytes(&encoded[..], ProduceResponse::KEY, 9).unwrap();
+        assert_eq!(42, decoded.correlation_id().unwrap());
+    }
+
+    #[test]
+    fn admitted_produce_reply_rejects_a_different_admitted_route() {
+        let frame = AdmittedFrame {
+            head: RequestHead {
+                body_len: 8,
+                api_key: 3,
+                api_version: 9,
+                correlation_id: 42,
+            },
+            payload: bytes::Bytes::new(),
+            lease: (),
+        };
+        assert!(matches!(
+            frame.reply_produce(ProduceResponse::default(), 64),
+            Err(tansu_sans_io::Error::NoSuchRequest(3))
+        ));
     }
 
     #[test]
