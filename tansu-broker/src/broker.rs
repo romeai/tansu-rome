@@ -731,6 +731,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
 #[cfg(test)]
 mod tests {
+    use crate::service::services_with_maximum_frame_size;
     use rama::{Context, Service as _};
     use tokio::{
         io::AsyncWriteExt as _,

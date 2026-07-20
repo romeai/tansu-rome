@@ -806,11 +806,11 @@ mod tests {
         let topic = "def";
 
         let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-            "../../../../tansu/etc/schema/grade.json"
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/grade.json")
         )))?;
 
         let kv = if let Value::Array(values) = serde_json::from_slice::<Value>(include_bytes!(
-            "../../../../tansu/etc/data/grades.json"
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/data/grades.json")
         ))? {
             values
                 .into_iter()

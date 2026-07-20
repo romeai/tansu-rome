@@ -232,7 +232,7 @@ mod json {
         let namespace = &alphanumeric_string(5)[..];
 
         let schema_registry = {
-            let schema = Bytes::from_static(include_bytes!("../../../tansu/etc/schema/grade.json"));
+            let schema = Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/grade.json")));
 
             let object_store = InMemory::new();
             let location = Path::from(format!("{topic}.json"));
@@ -244,7 +244,7 @@ mod json {
         };
 
         let kv = if let JsonValue::Array(values) = serde_json::from_slice::<JsonValue>(
-            include_bytes!("../../../tansu/etc/data/grades.json"),
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/data/grades.json")),
         )? {
             values
                 .into_iter()
@@ -896,7 +896,7 @@ mod proto {
         let namespace = &alphanumeric_string(5)[..];
         let topic = &alphanumeric_string(5)[..];
 
-        let proto = Bytes::from_static(include_bytes!("../../../tansu/etc/schema/taxi.proto"));
+        let proto = Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")));
 
         let schema_registry = {
             let object_store = InMemory::new();
@@ -964,7 +964,7 @@ mod proto {
         let namespace = &alphanumeric_string(5)[..];
         let topic = &alphanumeric_string(5)[..];
 
-        let proto = Bytes::from_static(include_bytes!("../../../tansu/etc/schema/taxi.proto"));
+        let proto = Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")));
 
         let schema_registry = {
             let object_store = InMemory::new();

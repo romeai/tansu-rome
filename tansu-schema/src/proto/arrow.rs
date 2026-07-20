@@ -1688,7 +1688,7 @@ mod tests {
         let _guard = init_tracing()?;
 
         let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-            "../../../../tansu/etc/schema/taxi.proto"
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
         )))?;
 
         let value = schema.encode_from_value(

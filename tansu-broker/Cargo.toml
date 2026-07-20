@@ -12,11 +12,11 @@ version.workspace = true
 
 [features]
 default = ["dynostore", "libsql", "postgres", "slatedb", "turso"]
-dynostore = ["dep:object_store"]
-libsql = ["dep:libsql"]
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+dynostore = ["dep:object_store", "tansu-storage/dynostore"]
+libsql = ["dep:libsql", "tansu-storage/libsql"]
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "tansu-storage/postgres"]
 slatedb = ["dep:object_store", "dep:slatedb", "tansu-storage/slatedb"]
-turso = ["dep:turso"]
+turso = ["dep:turso", "tansu-storage/turso"]
 
 [lints]
 workspace = true

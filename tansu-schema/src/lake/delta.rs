@@ -1021,7 +1021,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1114,7 +1114,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1218,7 +1218,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1332,7 +1332,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1446,7 +1446,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1550,7 +1550,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1664,7 +1664,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -1745,7 +1745,7 @@ mod tests {
             let topic = "taxi";
 
             let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-                "../../../../tansu/etc/schema/taxi.proto"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
             )))?;
 
             let value = schema.encode_from_value(
@@ -2364,10 +2364,10 @@ mod tests {
             let _guard = init_tracing()?;
 
             let definition =
-                Bytes::from_static(include_bytes!("../../../../tansu/etc/schema/grade.json"));
+                Bytes::from_static(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/grade.json")));
 
             let kv = if let Value::Array(values) = serde_json::from_slice::<Value>(include_bytes!(
-                "../../../../tansu/etc/data/grades.json"
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/data/grades.json")
             ))? {
                 values
                     .into_iter()

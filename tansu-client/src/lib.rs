@@ -116,7 +116,7 @@ use opentelemetry::{
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rama::{Context, Layer, Service};
 use tansu_sans_io::{ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, RootMessageMeta};
-use tansu_service::{FrameBytesLayer, FrameBytesService, host_port};
+use tansu_service::{FrameBytesLayer, FrameBytesService, TcpListenerError, host_port};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
@@ -151,6 +151,21 @@ pub enum Error {
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
+    }
+}
+
+impl<E> From<TcpListenerError<E>> for Error
+where
+    E: error::Error + 'static,
+{
+    fn from(value: TcpListenerError<E>) -> Self {
+        match value {
+            TcpListenerError::Io(error) => Self::Io(Arc::new(error)),
+            TcpListenerError::Policy(error) => Self::Message(error.to_string()),
+            TcpListenerError::TransportContextAlreadyConfigured => Self::Message(
+                "TCP transport configuration already exists in the connection context".into(),
+            ),
+        }
     }
 }
 
@@ -892,7 +907,8 @@ mod tests {
                     .and_then(|builder| builder.build())?,
             );
 
-        server.serve(Context::default(), listener).await
+        server.serve(Context::default(), listener).await?;
+        Ok(())
     }
 
     #[tokio::test]

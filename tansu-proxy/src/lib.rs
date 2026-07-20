@@ -36,7 +36,7 @@ use tansu_sans_io::{
 };
 use tansu_service::{
     BytesFrameLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer, host_port,
+    TcpContextLayer, TcpListenerError, TcpListenerLayer, host_port,
 };
 use tokio::{
     net::TcpListener,
@@ -109,6 +109,21 @@ impl From<ParseError> for Error {
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(Arc::new(value))
+    }
+}
+
+impl<E> From<TcpListenerError<E>> for Error
+where
+    E: std::error::Error + 'static,
+{
+    fn from(value: TcpListenerError<E>) -> Self {
+        match value {
+            TcpListenerError::Io(error) => Self::Io(Arc::new(error)),
+            TcpListenerError::Policy(error) => Self::Message(error.to_string()),
+            TcpListenerError::TransportContextAlreadyConfigured => Self::Message(
+                "TCP transport configuration already exists in the connection context".into(),
+            ),
+        }
     }
 }
 
