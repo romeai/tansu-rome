@@ -416,8 +416,10 @@ fn frame_prefix_must_match_the_complete_input() -> tansu_sans_io::Result<()> {
     Ok(())
 }
 
+/// The length prefix owns the frame: a second frame appended to the input is a
+/// framing disagreement, not a remnant inside one request.
 #[test]
-fn one_frame_must_consume_the_declared_input() -> tansu_sans_io::Result<()> {
+fn one_frame_must_describe_the_complete_input() -> tansu_sans_io::Result<()> {
     let encoded = sasl_handshake()?;
 
     let mut concatenated = encoded.to_vec();
@@ -426,14 +428,27 @@ fn one_frame_must_consume_the_declared_input() -> tansu_sans_io::Result<()> {
         Frame::request_from_bytes(&concatenated[..]),
         Err(Error::FrameSizeMismatch { .. })
     ));
+    Ok(())
+}
+
+/// Bytes the declared fields do not describe, but the length prefix does, are
+/// accepted for any api key: Apache Kafka's `RequestContext.parseRequest`
+/// returns without consulting `buffer.remaining()`, so a broker that rejects
+/// them rejects traffic the reference implementation serves. Every read stays
+/// inside the prefix, which the check above still enforces exactly.
+#[test]
+fn trailing_bytes_inside_one_frame_are_accepted() -> tansu_sans_io::Result<()> {
+    let encoded = sasl_handshake()?;
 
     let mut trailing = encoded.to_vec();
     trailing.extend_from_slice(&[0xAA, 0xBB]);
     let payload_bytes = trailing.len() - size_of::<i32>();
     trailing[..4].copy_from_slice(&i32::try_from(payload_bytes)?.to_be_bytes());
+
+    let frame = Frame::request_from_bytes(&trailing[..])?;
     assert!(matches!(
-        Frame::request_from_bytes(&trailing[..]),
-        Err(Error::TrailingFrameBytes(2))
+        frame.body,
+        tansu_sans_io::Body::SaslHandshakeRequest { .. }
     ));
     Ok(())
 }

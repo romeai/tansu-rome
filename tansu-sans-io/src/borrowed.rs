@@ -201,12 +201,14 @@ impl<'a> Cursor<'a> {
         self.budget.work_units
     }
 
-    pub(crate) fn finish(&self) -> Result<()> {
-        if self.position == self.bytes.len() {
-            Ok(())
-        } else {
-            Err(Error::TrailingFrameBytes(self.bytes.len() - self.position))
-        }
+    /// Bytes of the frame left over after the declared fields were read.
+    ///
+    /// Non-zero is not an error on the request path: see
+    /// [`crate::trailing_request_bytes`]. Reads remain bounded by the frame,
+    /// whose length prefix `Cursor::request` already validated against the
+    /// complete input.
+    pub(crate) fn trailing(&self) -> usize {
+        self.bytes.len() - self.position
     }
 
     pub(crate) fn i8(&mut self) -> Result<i8> {

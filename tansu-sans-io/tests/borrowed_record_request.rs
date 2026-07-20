@@ -232,7 +232,7 @@ fn record_payload_is_opaque_to_request_validation() -> tansu_sans_io::Result<()>
 }
 
 #[test]
-fn exact_frame_consumption_rejects_truncation_and_trailing_bytes() -> tansu_sans_io::Result<()> {
+fn truncated_or_over_long_inputs_are_rejected() -> tansu_sans_io::Result<()> {
     let encoded = encoded_request(
         8,
         [topic(
@@ -250,6 +250,32 @@ fn exact_frame_consumption_rejects_truncation_and_trailing_bytes() -> tansu_sans
         BorrowedProduceRequest::from_bytes(trailing.freeze()),
         Err(Error::FrameSizeMismatch { .. })
     ));
+    Ok(())
+}
+
+/// The borrowed request views relax exactly as the owned decoder does: bytes
+/// inside the declared frame that the schema's fields do not describe are
+/// accepted, matching Apache Kafka's `RequestContext.parseRequest`, which never
+/// checks `buffer.remaining()`. Produce rather than Metadata, so this is a
+/// property of the request path and not of one client's Metadata shape.
+#[test]
+fn trailing_bytes_inside_the_declared_frame_are_accepted() -> tansu_sans_io::Result<()> {
+    let encoded = encoded_request(
+        8,
+        [topic(
+            "events",
+            [PartitionProduceData::default().index(0).records(None)],
+        )],
+    )?;
+
+    let mut padded = BytesMut::from(&encoded[..]);
+    padded.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+    let payload_bytes = i32::try_from(padded.len() - size_of::<i32>())?;
+    padded[..size_of::<i32>()].copy_from_slice(&payload_bytes.to_be_bytes());
+
+    let view = BorrowedProduceRequest::from_bytes(padded.freeze())?;
+    assert_eq!(8, view.api_version());
+    assert_eq!(42, view.correlation_id());
     Ok(())
 }
 

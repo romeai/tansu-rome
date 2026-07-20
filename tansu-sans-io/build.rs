@@ -1873,7 +1873,10 @@ fn borrowed_record_request(message: &Message) -> TokenStream {
                         if flexible {
                             cursor.tagged_fields()?;
                         }
-                        cursor.finish()?;
+                        let trailing = cursor.trailing();
+                        if trailing > 0 {
+                            crate::trailing_request_bytes(API_KEY, api_version, trailing);
+                        }
                         (#(#assignments,)*)
                     };
                     let structural_work_units = cursor.work_units();

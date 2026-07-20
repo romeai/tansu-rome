@@ -494,7 +494,6 @@ pub enum Error {
     TryFromInt(#[from] num::TryFromIntError),
     TryFromSlice(#[from] TryFromSliceError),
     TryGet(Arc<TryGetError>),
-    TrailingFrameBytes(usize),
     UnexpectedType(String),
     UnknownApiErrorCode(i16),
     UnknownAssignor(String),
@@ -698,6 +697,20 @@ fn fix_length(mut encoded: BytesMut) -> Result<Bytes> {
     Ok(sz.freeze())
 }
 
+/// Record a request frame that carried more bytes than its declared fields describe.
+///
+/// Apache Kafka accepts such a frame: `RequestContext::parseRequest` hands the buffer to
+/// `AbstractRequest::parseRequest` and returns without checking `buffer.remaining()`. A remnant
+/// is nevertheless worth surfacing, since it means the peer's encoder and this schema disagree
+/// about the request's shape and the fields decoded after the divergence may not be the ones the
+/// peer intended. Emitted once per frame at `warn`, never per byte.
+pub(crate) fn trailing_request_bytes(api_key: i16, api_version: i16, trailing: usize) {
+    warn!(
+        api_key,
+        api_version, trailing, "request frame carries bytes beyond its declared fields"
+    );
+}
+
 impl Frame {
     fn elapsed_millis(start: SystemTime) -> u64 {
         start
@@ -735,9 +748,17 @@ impl Frame {
 
     /// Deserialize one complete length-prefixed API request frame under explicit resource limits.
     ///
-    /// The input must contain exactly one frame: its prefix must equal the number of following
-    /// bytes, and decoding must consume all of them. The complete frame and every peer-declared
-    /// value are checked before the decoder allocates or traverses that value.
+    /// The input must contain exactly one frame: its length prefix must equal the number of
+    /// following bytes. Every peer-declared value is checked before the decoder allocates or
+    /// traverses it, and no read may pass the declared frame.
+    ///
+    /// Bytes left over after the request body's declared fields have been decoded are reported
+    /// but not rejected. Apache Kafka's own `RequestContext::parseRequest` returns as soon as
+    /// `AbstractRequest::parseRequest` has read the declared fields and never inspects
+    /// `buffer.remaining()`, so a request carrying a trailing remnant is accepted by the
+    /// reference implementation. Accepting it here is what a broker must do to interoperate with
+    /// clients written against that behaviour; it costs nothing, because the frame prefix still
+    /// bounds every read. Responses stay strict: this crate controls what it emits.
     #[instrument(skip_all)]
     pub fn request_from_bytes_with_limits(
         encoded: impl Buf,
@@ -771,9 +792,17 @@ impl Frame {
         let frame = Frame::deserialize(&mut deserializer)?;
         drop(deserializer);
 
-        let remaining = reader.get_ref().remaining();
-        if remaining > 0 {
-            return Err(Error::TrailingFrameBytes(remaining));
+        let trailing = reader.get_ref().remaining();
+        if trailing > 0 {
+            let (api_key, api_version) = match frame.header {
+                Header::Request {
+                    api_key,
+                    api_version,
+                    ..
+                } => (api_key, api_version),
+                Header::Response { .. } => (-1, -1),
+            };
+            trailing_request_bytes(api_key, api_version, trailing);
         }
 
         debug!(?frame, elapsed_millis = Self::elapsed_millis(start));
