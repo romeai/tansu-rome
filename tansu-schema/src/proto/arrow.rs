@@ -1687,9 +1687,10 @@ mod tests {
     async fn taxi() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let schema = Schema::try_from(Bytes::from_static(include_bytes!(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../etc/schema/taxi.proto")
-        )))?;
+        let schema = Schema::try_from(Bytes::from_static(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../etc/schema/taxi.proto"
+        ))))?;
 
         let value = schema.encode_from_value(
             MessageKind::Value,
