@@ -118,7 +118,7 @@ use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
 #[cfg(feature = "dynostore")]
-use dynostore::DynoStore;
+pub use dynostore::DynoStore;
 
 use glob::{GlobError, PatternError};
 
